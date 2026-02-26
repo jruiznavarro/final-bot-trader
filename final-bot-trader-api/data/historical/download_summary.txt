@@ -1,0 +1,34 @@
+Download Summary - 2026-02-01 02:21:59
+Interval: 4h
+Period: 2024-02-01 to 2026-02-01
+
+XRPUSDT (L1-Alt): 1607 candles
+AAVEUSDT (DeFi): 1607 candles
+BCHUSDT (L1-Alt): 1607 candles
+ONDOUSDT (RWA): 1607 candles
+SOLUSDT (L1-Major): 1607 candles
+DOGEUSDT (L1-Alt): 1607 candles
+BTCUSDT (L1-Major): 1607 candles
+HBARUSDT (L1-Alt): 1607 candles
+UNIUSDT (DeFi): 1607 candles
+1000PEPEUSDT (Meme): 1607 candles
+ICPUSDT (Infra): 1607 candles
+FILUSDT (Infra): 1607 candles
+WIFUSDT (Meme): 1607 candles
+SUIUSDT (L1-Major): 1607 candles
+ARBUSDT (L2): 1607 candles
+ENAUSDT (DeFi): 1535 candles
+TAOUSDT (AI): 1475 candles
+LINKUSDT (DeFi): 1607 candles
+AVAXUSDT (L1-Major): 1607 candles
+DOTUSDT (Infra): 1607 candles
+1000BONKUSDT (Meme): 1607 candles
+WLDUSDT (AI): 1607 candles
+ETHUSDT (L1-Major): 1607 candles
+ADAUSDT (L1-Major): 1607 candles
+LTCUSDT (L1-Alt): 1607 candles
+1000SHIBUSDT (Meme): 1607 candles
+APTUSDT (L1-Major): 1607 candles
+TRUMPUSDT (Meme-Political): 878 candles
+NEARUSDT (L1-Major): 1607 candles
+HYPEUSDT (New): 803 candles

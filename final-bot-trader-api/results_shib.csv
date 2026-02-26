@@ -1,0 +1,16 @@
+Symbol,Strategy,Interval,TotalTrades,WinRate,TotalReturn,MaxDrawdown,SharpeRatio,ProfitFactor,CandlesUsed,StartDate,EndDate,Parameters
+1000SHIBUSDT,"SMA_Crossover(5,20)",1d,15,53.33,6.99,3.64,5.04,1.96,400,2024-12-26,2026-01-31,"{""long_period"":20,""short_period"":5}"
+1000SHIBUSDT,"RSI_Strategy(7,70,30)",1d,20,45.00,5.14,6.41,2.55,1.41,400,2024-12-26,2026-01-31,"{""overbought"":70,""oversold"":30,""period"":7}"
+1000SHIBUSDT,"RSI_Strategy(14,65,35)",1d,16,43.75,3.68,6.41,2.18,1.33,400,2024-12-26,2026-01-31,"{""overbought"":65,""oversold"":35,""period"":14}"
+1000SHIBUSDT,"RSI_Strategy(14,75,25)",1d,2,50.00,1.03,1.75,3.99,2.08,400,2024-12-26,2026-01-31,"{""overbought"":75,""oversold"":25,""period"":14}"
+1000SHIBUSDT,Confluence_Aggressive,1d,18,33.33,-0.46,6.30,-0.15,0.96,400,2024-12-26,2026-01-31,"{""min_confluence"":60,""variant"":""Aggressive""}"
+1000SHIBUSDT,"SMA_Crossover(50,200)",1d,1,0.00,-0.89,2.13,0.00,0.00,400,2024-12-26,2026-01-31,"{""long_period"":200,""short_period"":50}"
+1000SHIBUSDT,"RSI_Strategy(21,70,30)",1d,1,0.00,-0.95,1.04,0.00,0.00,400,2024-12-26,2026-01-31,"{""overbought"":70,""oversold"":30,""period"":21}"
+1000SHIBUSDT,"RSI_Strategy(14,70,30)",1d,6,33.33,-1.29,3.44,-1.93,0.75,400,2024-12-26,2026-01-31,"{""overbought"":70,""oversold"":30,""period"":14}"
+1000SHIBUSDT,"SMA_Crossover(10,50)",1d,9,33.33,-1.48,4.67,-2.20,0.72,400,2024-12-26,2026-01-31,"{""long_period"":50,""short_period"":10}"
+1000SHIBUSDT,Confluence_Conservative,1d,3,0.00,-3.21,4.76,-211.47,0.00,400,2024-12-26,2026-01-31,"{""min_confluence"":80,""variant"":""Conservative""}"
+1000SHIBUSDT,"SMA_Crossover(20,50)",1d,7,14.29,-4.18,5.11,-11.79,0.22,400,2024-12-26,2026-01-31,"{""long_period"":50,""short_period"":20}"
+1000SHIBUSDT,"SMA_Crossover(20,100)",1d,6,0.00,-4.99,5.26,-103.25,0.00,400,2024-12-26,2026-01-31,"{""long_period"":100,""short_period"":20}"
+1000SHIBUSDT,Adaptive(21/55),1d,14,21.43,-7.00,10.45,-6.91,0.37,400,2024-12-26,2026-01-31,null
+1000SHIBUSDT,"SMA_Crossover(10,30)",1d,10,10.00,-7.58,8.59,-22.49,0.08,400,2024-12-26,2026-01-31,"{""long_period"":30,""short_period"":10}"
+1000SHIBUSDT,Confluence_Default,1d,16,18.75,-7.90,11.12,-6.80,0.38,400,2024-12-26,2026-01-31,"{""min_confluence"":70,""variant"":""Default""}"

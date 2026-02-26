@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: trading-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader_password
+      POSTGRES_DB: trading_bot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d trading_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Trading Bot + API
+  bot:
+    build:
+      context: ./final-bot-trader-api
+      dockerfile: Dockerfile
+    container_name: trading-bot
+    restart: unless-stopped
+    # DRY RUN mode (simulation) - remove --dry-run for live trading
+    command: ["/app/bot", "--auto-confirm", "--dry-run"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Bitunix API credentials
+      BITUNIX_API_KEY: ${BITUNIX_API_KEY}
+      BITUNIX_SECRET_KEY: ${BITUNIX_SECRET_KEY}
+      # Telegram notifications
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: trader
+      DB_PASSWORD: trader_password
+      DB_NAME: trading_bot
+      DB_SSLMODE: disable
+      # API
+      API_PORT: 8080
+      # Timezone
+      TZ: Europe/Madrid
+    volumes:
+      - bot_data:/app/data
+      - bot_logs:/app/logs
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # Dashboard (React + Nginx)
+  dashboard:
+    build:
+      context: ./final-bot-trader-dashboard
+      dockerfile: Dockerfile
+    container_name: trading-dashboard
+    restart: unless-stopped
+    depends_on:
+      - bot
+    ports:
+      - "3001:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  bot_data:
+  bot_logs:

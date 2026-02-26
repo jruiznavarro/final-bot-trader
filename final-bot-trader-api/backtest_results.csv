@@ -1,0 +1,16 @@
+Symbol,Strategy,Interval,TotalTrades,WinRate,TotalReturn,MaxDrawdown,SharpeRatio,ProfitFactor,CandlesUsed,StartDate,EndDate,Parameters
+BTCUSDT,"SMA_Crossover(20,50)",4h,23,56.52,1.59,1.67,3.89,1.67,1200,2025-07-14,2026-01-31,"{""long_period"":50,""short_period"":20}"
+BTCUSDT,"RSI_Strategy(21,70,30)",4h,15,53.33,1.57,0.78,4.94,2.10,1200,2025-07-14,2026-01-31,"{""overbought"":70,""oversold"":30,""period"":21}"
+BTCUSDT,"RSI_Strategy(14,75,25)",4h,20,50.00,1.45,1.07,3.61,1.72,1200,2025-07-14,2026-01-31,"{""overbought"":75,""oversold"":25,""period"":14}"
+BTCUSDT,"SMA_Crossover(10,30)",4h,31,45.16,0.93,0.95,1.74,1.27,1200,2025-07-14,2026-01-31,"{""long_period"":30,""short_period"":10}"
+BTCUSDT,"SMA_Crossover(50,200)",4h,7,42.86,0.16,0.42,1.44,1.24,1200,2025-07-14,2026-01-31,"{""long_period"":200,""short_period"":50}"
+BTCUSDT,"SMA_Crossover(20,100)",4h,15,46.67,0.02,0.96,0.10,1.01,1200,2025-07-14,2026-01-31,"{""long_period"":100,""short_period"":20}"
+BTCUSDT,Confluence_Conservative,4h,17,35.29,-0.34,1.26,-0.95,0.87,1200,2025-07-14,2026-01-31,"{""min_confluence"":80,""variant"":""Conservative""}"
+BTCUSDT,"RSI_Strategy(14,70,30)",4h,32,34.38,-0.40,2.45,-0.62,0.91,1200,2025-07-14,2026-01-31,"{""overbought"":70,""oversold"":30,""period"":14}"
+BTCUSDT,"SMA_Crossover(10,50)",4h,31,38.71,-0.42,2.39,-0.78,0.90,1200,2025-07-14,2026-01-31,"{""long_period"":50,""short_period"":10}"
+BTCUSDT,"SMA_Crossover(5,20)",4h,42,33.33,-0.50,2.51,-0.66,0.91,1200,2025-07-14,2026-01-31,"{""long_period"":20,""short_period"":5}"
+BTCUSDT,Confluence_Aggressive,4h,74,36.49,-1.14,1.90,-0.84,0.89,1200,2025-07-14,2026-01-31,"{""min_confluence"":60,""variant"":""Aggressive""}"
+BTCUSDT,Adaptive(21/55),4h,39,28.21,-2.34,3.04,-3.39,0.63,1200,2025-07-14,2026-01-31,null
+BTCUSDT,Confluence_Default,4h,68,32.35,-3.25,3.79,-2.96,0.67,1200,2025-07-14,2026-01-31,"{""min_confluence"":70,""variant"":""Default""}"
+BTCUSDT,"RSI_Strategy(14,65,35)",4h,54,24.07,-3.60,5.08,-3.88,0.58,1200,2025-07-14,2026-01-31,"{""overbought"":65,""oversold"":35,""period"":14}"
+BTCUSDT,"RSI_Strategy(7,70,30)",4h,68,26.47,-3.66,5.56,-3.18,0.64,1200,2025-07-14,2026-01-31,"{""overbought"":70,""oversold"":30,""period"":7}"

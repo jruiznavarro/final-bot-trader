@@ -1,0 +1,12 @@
+# Live Trading Override - USE WITH CAUTION
+# This file removes the --dry-run flag to enable real trading
+#
+# Usage: docker compose -f docker-compose.yml -f docker-compose.live.yml up -d --build
+#
+# WARNING: This will execute REAL trades with REAL money!
+
+version: '3.8'
+
+services:
+  bot:
+    command: ["/app/bot", "--auto-confirm"]

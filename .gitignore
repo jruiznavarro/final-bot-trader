@@ -1,0 +1,17 @@
+# Env y secretos (nunca subir)
+.env
+.env.local
+.env.*.local
+server.txt
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+nul
+.idea/
+.vscode/
+.claude/
+
+# Binarios compilados (opcional, si no quieres subirlos)
+# final-bot-trader-api/live-trading
+# final-bot-trader-api/monitor

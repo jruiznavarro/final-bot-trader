@@ -1,0 +1,283 @@
+package livetrading
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"final-bot-trader-api/internal/exchange"
+	"final-bot-trader-api/internal/telegram"
+)
+
+// TrailingStopConfig holds trailing stop configuration
+type TrailingStopConfig struct {
+	Enabled          bool    // Enable trailing stop
+	ActivationPct    float64 // Minimum profit % to activate trailing (e.g., 0.5 = 0.5%)
+	TrailPct         float64 // Trail distance as % of price (e.g., 0.3 = 0.3%)
+	CheckIntervalSec int     // How often to check prices (seconds)
+}
+
+// DefaultTrailingStopConfig returns default trailing stop configuration
+func DefaultTrailingStopConfig() TrailingStopConfig {
+	return TrailingStopConfig{
+		Enabled:          true,
+		ActivationPct:    1.5,  // Activate when 1.5% in profit (was 1.0)
+		TrailPct:         0.8,  // Trail 0.8% behind price (was 0.3, more room for volatility)
+		CheckIntervalSec: 15,   // Check every 15 seconds
+	}
+}
+
+// TrailingStopManager manages trailing stops for open positions
+type TrailingStopManager struct {
+	config   TrailingStopConfig
+	client   *exchange.BitunixClient
+	engine   *Engine
+	telegram *telegram.Client
+	stopCh   chan struct{}
+	running  bool
+	mu       sync.RWMutex
+	// Track the best price seen for each position
+	bestPrices     map[string]float64 // tradeID -> best price
+	trailingLevels map[string]float64 // tradeID -> current trailing stop level
+	activated      map[string]bool    // tradeID -> whether trailing is activated
+}
+
+// NewTrailingStopManager creates a new trailing stop manager
+func NewTrailingStopManager(client *exchange.BitunixClient, engine *Engine, tg *telegram.Client, config TrailingStopConfig) *TrailingStopManager {
+	return &TrailingStopManager{
+		config:         config,
+		client:         client,
+		engine:         engine,
+		telegram:       tg,
+		stopCh:         make(chan struct{}),
+		bestPrices:     make(map[string]float64),
+		trailingLevels: make(map[string]float64),
+		activated:      make(map[string]bool),
+	}
+}
+
+// Start starts the trailing stop manager
+func (m *TrailingStopManager) Start(ctx context.Context) {
+	if !m.config.Enabled {
+		log.Println("Trailing stop: DISABLED")
+		return
+	}
+
+	m.running = true
+	log.Printf("Trailing stop: ENABLED (activation: %.2f%%, trail: %.2f%%)",
+		m.config.ActivationPct, m.config.TrailPct)
+
+	ticker := time.NewTicker(time.Duration(m.config.CheckIntervalSec) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			m.running = false
+			return
+		case <-m.stopCh:
+			m.running = false
+			return
+		case <-ticker.C:
+			m.checkAndUpdateStops(ctx)
+		}
+	}
+}
+
+// Stop stops the trailing stop manager
+func (m *TrailingStopManager) Stop() {
+	if m.running {
+		close(m.stopCh)
+	}
+}
+
+func (m *TrailingStopManager) checkAndUpdateStops(ctx context.Context) {
+	openTrades := m.engine.GetOpenTrades()
+	if len(openTrades) == 0 {
+		return
+	}
+
+	for _, trade := range openTrades {
+		if err := m.checkTradeTrailingStop(ctx, &trade); err != nil {
+			log.Printf("[%s] Trailing stop error: %v", trade.Symbol, err)
+		}
+	}
+}
+
+func (m *TrailingStopManager) checkTradeTrailingStop(ctx context.Context, trade *Trade) error {
+	// Get current price
+	currentPrice, err := m.client.GetPrice(ctx, trade.Symbol)
+	if err != nil {
+		return err
+	}
+
+	isLong := trade.Side == "LONG"
+
+	// Calculate current profit percentage
+	var profitPct float64
+	if isLong {
+		profitPct = ((currentPrice - trade.EntryPrice) / trade.EntryPrice) * 100
+	} else {
+		profitPct = ((trade.EntryPrice - currentPrice) / trade.EntryPrice) * 100
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if trailing stop should be activated
+	if !m.activated[trade.ID] {
+		if profitPct < m.config.ActivationPct {
+			return nil // Not enough profit to activate
+		}
+		// Activate trailing stop
+		m.activated[trade.ID] = true
+		m.bestPrices[trade.ID] = currentPrice
+		m.trailingLevels[trade.ID] = m.calculateTrailingLevel(currentPrice, isLong)
+		log.Printf("[%s] 🎯 Trailing stop ACTIVATED at %.2f%% profit (price: %.6f, trail: %.6f)",
+			trade.Symbol, profitPct, currentPrice, m.trailingLevels[trade.ID])
+		return nil
+	}
+
+	// Trailing stop is active - track best price
+	bestPrice := m.bestPrices[trade.ID]
+	priceImproved := false
+
+	if isLong {
+		if currentPrice > bestPrice {
+			m.bestPrices[trade.ID] = currentPrice
+			bestPrice = currentPrice
+			priceImproved = true
+		}
+	} else {
+		if currentPrice < bestPrice {
+			m.bestPrices[trade.ID] = currentPrice
+			bestPrice = currentPrice
+			priceImproved = true
+		}
+	}
+
+	// Update trailing level if price improved
+	if priceImproved {
+		newTrailingLevel := m.calculateTrailingLevel(bestPrice, isLong)
+		oldLevel := m.trailingLevels[trade.ID]
+
+		// Only update if new level is better (protects more profit)
+		shouldUpdate := false
+		if isLong && newTrailingLevel > oldLevel {
+			shouldUpdate = true
+		} else if !isLong && newTrailingLevel < oldLevel {
+			shouldUpdate = true
+		}
+
+		if shouldUpdate {
+			m.trailingLevels[trade.ID] = newTrailingLevel
+			currentProfitPct := m.calculateProfitPct(trade.EntryPrice, newTrailingLevel, isLong)
+			log.Printf("[%s] 📈 Trailing stop moved: %.6f -> %.6f (locks %.2f%% profit)",
+				trade.Symbol, oldLevel, newTrailingLevel, currentProfitPct)
+
+			// Update in engine state (for display purposes)
+			m.engine.UpdateTradeStopLoss(trade.ID, newTrailingLevel)
+		}
+	}
+
+	// Check if trailing stop was hit
+	trailingLevel := m.trailingLevels[trade.ID]
+	stopHit := false
+	if isLong && currentPrice <= trailingLevel {
+		stopHit = true
+	} else if !isLong && currentPrice >= trailingLevel {
+		stopHit = true
+	}
+
+	if stopHit {
+		log.Printf("[%s] 🛑 TRAILING STOP HIT! Closing position at %.6f (trail level: %.6f)",
+			trade.Symbol, currentPrice, trailingLevel)
+
+		// Close the position
+		if err := m.closePosition(ctx, trade, currentPrice, profitPct); err != nil {
+			log.Printf("[%s] Error closing position: %v", trade.Symbol, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (m *TrailingStopManager) calculateTrailingLevel(price float64, isLong bool) float64 {
+	if isLong {
+		return price * (1 - m.config.TrailPct/100)
+	}
+	return price * (1 + m.config.TrailPct/100)
+}
+
+func (m *TrailingStopManager) calculateProfitPct(entryPrice, exitPrice float64, isLong bool) float64 {
+	if isLong {
+		return ((exitPrice - entryPrice) / entryPrice) * 100
+	}
+	return ((entryPrice - exitPrice) / entryPrice) * 100
+}
+
+func (m *TrailingStopManager) closePosition(ctx context.Context, trade *Trade, exitPrice, profitPct float64) error {
+	// Get position ID from exchange
+	positions, err := m.client.GetPositions(ctx)
+	if err != nil {
+		return err
+	}
+
+	var positionID string
+	for _, pos := range positions {
+		if pos.Symbol == trade.Symbol && pos.PositionAmt != 0 {
+			positionID = pos.PositionID
+			break
+		}
+	}
+
+	if positionID == "" {
+		log.Printf("[%s] Position already closed or not found", trade.Symbol)
+		return nil
+	}
+
+	// Flash close the position
+	if err := m.client.FlashClosePosition(ctx, positionID); err != nil {
+		return err
+	}
+
+	// Calculate actual PnL
+	isLong := trade.Side == "LONG"
+	var pnl float64
+	if isLong {
+		pnl = (exitPrice - trade.EntryPrice) * trade.Quantity
+	} else {
+		pnl = (trade.EntryPrice - exitPrice) * trade.Quantity
+	}
+
+	log.Printf("[%s] ✅ Position closed by trailing stop | PnL: %+.4f USDT (%.2f%%)",
+		trade.Symbol, pnl, profitPct)
+
+	// Send Telegram notification
+	if m.telegram != nil && m.telegram.IsConfigured() {
+		msg := fmt.Sprintf("🎯 *TRAILING STOP HIT*\n\n"+
+			"Symbol: `%s`\n"+
+			"Side: %s\n"+
+			"Entry: `%.6f`\n"+
+			"Exit: `%.6f`\n"+
+			"PnL: `%+.4f USDT` (%.2f%%)\n\n"+
+			"_Profit protected by trailing stop_",
+			trade.Symbol, trade.Side, trade.EntryPrice, exitPrice, pnl, profitPct)
+		m.telegram.SendMessage(msg)
+	}
+
+	// Cleanup tracking
+	delete(m.bestPrices, trade.ID)
+	delete(m.trailingLevels, trade.ID)
+	delete(m.activated, trade.ID)
+
+	return nil
+}
+
+// CleanupClosedTrade removes tracking for a closed trade
+func (m *TrailingStopManager) CleanupClosedTrade(tradeID string) {
+	delete(m.bestPrices, tradeID)
+}
