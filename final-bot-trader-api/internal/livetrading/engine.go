@@ -54,19 +54,20 @@ type TradingState struct {
 // Config holds live trading configuration
 type Config struct {
 	Symbols           []string
-	PositionSizeUSDT  float64 // Fixed USDT amount per trade (fallback)
-	PositionSizePct   float64 // Position size as % of balance (e.g., 0.10 = 10%)
+	PositionSizeUSDT  float64       // Fixed USDT amount per trade (fallback)
+	PositionSizePct   float64       // Position size as % of balance (e.g., 0.10 = 10%)
 	Leverage          int
-	Interval          string  // Deprecated: use PrimaryInterval
-	PrimaryInterval   string  // Higher timeframe for trend (e.g., "4h")
-	EntryInterval     string  // Lower timeframe for entries (e.g., "1h")
-	UseMultiTimeframe bool    // Enable multi-timeframe analysis
+	Interval          string        // Deprecated: use PrimaryInterval
+	PrimaryInterval   string        // Higher timeframe for trend (e.g., "4h")
+	EntryInterval     string        // Lower timeframe for entries (e.g., "1h")
+	UseMultiTimeframe bool          // Enable multi-timeframe analysis
 	StateFile         string
 	VolumeThreshold   float64
-	MaxDailyLoss      float64 // Max daily loss in USDT
-	MaxDailyTrades    int     // Max trades per day
-	MaxOpenPositions  int     // Max simultaneous positions
-	DryRun            bool    // If true, log signals but don't execute
+	MaxDailyLoss      float64       // Max daily loss in USDT
+	MaxDailyTrades    int           // Max trades per day
+	MaxOpenPositions  int           // Max simultaneous positions
+	CooldownPeriod    time.Duration // Min time between closing and re-entering same symbol
+	DryRun            bool          // If true, log signals but don't execute
 }
 
 // DefaultConfig returns default live trading configuration
@@ -91,27 +92,29 @@ func DefaultConfig() Config {
 		UseMultiTimeframe: true,  // Enable MTF by default
 		StateFile:         "/app/data/live_trading_state.json",
 		VolumeThreshold:   1.0,   // Require at least average volume
-		MaxDailyLoss:      5,     // Stop if losing $5/day (3% of $165)
-		MaxDailyTrades:    8,     // Max 8 trades per day (conservative)
-		MaxOpenPositions:  2,     // Max 2 positions at once (reduce risk)
+		MaxDailyLoss:      5,              // Stop if losing $5/day (3% of $165)
+		MaxDailyTrades:    8,              // Max 8 trades per day (conservative)
+		MaxOpenPositions:  2,              // Max 2 positions at once (reduce risk)
+		CooldownPeriod:    4 * time.Hour,  // Don't re-enter same symbol for 1 primary candle
 		DryRun:            false,
 	}
 }
 
 // Engine is the live trading engine
 type Engine struct {
-	config         Config
-	client         *exchange.BitunixClient
-	telegram       *telegram.Client
-	tradeRepo      *database.TradeRepository // Optional: for persisting trades
-	circuitBreaker *TradingCircuitBreaker    // Risk management circuit breaker
-	state          *TradingState
-	strategies     map[string]*multifactor.MultiFactorStrategy // Single TF strategies
-	mtfStrategies  map[string]*multifactor.MTFStrategy         // Multi TF strategies
-	symbolInfo     map[string]*model.SymbolInfo
-	mu             sync.RWMutex
-	running        bool
-	stopCh         chan struct{}
+	config          Config
+	client          *exchange.BitunixClient
+	telegram        *telegram.Client
+	tradeRepo       *database.TradeRepository // Optional: for persisting trades
+	circuitBreaker  *TradingCircuitBreaker    // Risk management circuit breaker
+	state           *TradingState
+	strategies      map[string]*multifactor.MultiFactorStrategy // Single TF strategies
+	mtfStrategies   map[string]*multifactor.MTFStrategy         // Multi TF strategies
+	symbolInfo      map[string]*model.SymbolInfo
+	lastClosedTime  map[string]time.Time // symbol -> time of last close (cooldown)
+	mu              sync.RWMutex
+	running         bool
+	stopCh          chan struct{}
 }
 
 // NewEngine creates a new live trading engine
@@ -157,15 +160,16 @@ func NewEngine(client *exchange.BitunixClient, tg *telegram.Client, config Confi
 	circuitBreaker := NewTradingCircuitBreaker(cbConfig, tg, initialBalance)
 
 	return &Engine{
-		config:         config,
-		client:         client,
-		telegram:       tg,
-		circuitBreaker: circuitBreaker,
-		state:          state,
-		strategies:     strategies,
-		mtfStrategies:  mtfStrategies,
-		symbolInfo:     make(map[string]*model.SymbolInfo),
-		stopCh:         make(chan struct{}),
+		config:          config,
+		client:          client,
+		telegram:        tg,
+		circuitBreaker:  circuitBreaker,
+		state:           state,
+		strategies:      strategies,
+		mtfStrategies:   mtfStrategies,
+		symbolInfo:      make(map[string]*model.SymbolInfo),
+		lastClosedTime:  make(map[string]time.Time),
+		stopCh:          make(chan struct{}),
 	}
 }
 
@@ -381,6 +385,8 @@ func (e *Engine) syncPositions(ctx context.Context) {
 			trade.Status = "CLOSED"
 			trade.ExitTime = time.Now()
 			closedTrades = append(closedTrades, *trade)
+			// Record close time so processSymbol can enforce the cooldown period
+			e.lastClosedTime[trade.Symbol] = time.Now()
 		}
 	}
 
@@ -461,47 +467,43 @@ func (e *Engine) calculateClosedTradePnL(ctx context.Context, trade *Trade) (exi
 
 	isLong := trade.Side == "LONG"
 
-	// Use current price as exit price (position just closed, so current price is close to exit)
-	if currentPrice > 0 {
+	// Determine exit reason and price using TP/SL levels, which are known exact
+	// execution prices (limit/stop orders on Bitunix). Using the current market
+	// price at detection time is unreliable because the bot checks every 1h and
+	// the actual fill may have happened long before detection.
+	tpDist := abs(currentPrice - trade.TakeProfit)
+	slDist := abs(currentPrice - trade.StopLoss)
+
+	if trade.StopLoss > 0 && trade.TakeProfit > 0 {
+		// Check if trailing stop moved the SL past entry (into profit territory)
+		trailingActive := (isLong && trade.StopLoss > trade.EntryPrice) ||
+			(!isLong && trade.StopLoss < trade.EntryPrice)
+
+		if trailingActive {
+			// Trailing stop fired: exit at the current trailing SL level
+			exitPrice = trade.StopLoss
+			reason = "Trailing stop"
+		} else if tpDist < slDist {
+			exitPrice = trade.TakeProfit
+			reason = "Take Profit hit"
+		} else {
+			exitPrice = trade.StopLoss
+			reason = "Stop Loss hit"
+		}
+	} else if currentPrice > 0 {
+		// No TP/SL recorded: fall back to current price
 		exitPrice = currentPrice
-	} else if isLong {
-		// Fallback: estimate based on TP/SL proximity
-		exitPrice = trade.TakeProfit // optimistic fallback
+		reason = "Closed (no TP/SL recorded)"
 	} else {
-		exitPrice = trade.TakeProfit
+		exitPrice = trade.EntryPrice
+		reason = "Closed (price unknown)"
 	}
 
-	// Calculate PnL with real prices
+	// Calculate PnL with the resolved exit price
 	if isLong {
 		pnl = (exitPrice - trade.EntryPrice) * trade.Quantity
 	} else {
 		pnl = (trade.EntryPrice - exitPrice) * trade.Quantity
-	}
-
-	// Determine reason based on how close the exit is to TP or SL
-	if isLong {
-		tpDist := abs(exitPrice - trade.TakeProfit)
-		slDist := abs(exitPrice - trade.StopLoss)
-		if tpDist < slDist {
-			reason = "Take Profit hit"
-		} else {
-			reason = "Stop Loss hit"
-		}
-	} else {
-		tpDist := abs(exitPrice - trade.TakeProfit)
-		slDist := abs(exitPrice - trade.StopLoss)
-		if tpDist < slDist {
-			reason = "Take Profit hit"
-		} else {
-			reason = "Stop Loss hit"
-		}
-	}
-
-	// Check if trailing stop was the reason (SL was moved closer to entry)
-	if isLong && trade.StopLoss > trade.EntryPrice {
-		reason = "Trailing stop"
-	} else if !isLong && trade.StopLoss < trade.EntryPrice {
-		reason = "Trailing stop"
 	}
 
 	log.Printf("[%s] Trade closed: entry=%.6f exit=%.6f qty=%.4f pnl=%.4f reason=%s",
@@ -526,6 +528,20 @@ func (e *Engine) processSymbol(ctx context.Context, symbol string) error {
 	// Check max open positions
 	if e.countOpenPositions() >= e.config.MaxOpenPositions {
 		return nil
+	}
+
+	// Enforce cooldown: don't re-enter the same symbol until one primary candle
+	// has elapsed since the last close. Prevents re-entering on the same stale
+	// signal that just closed the previous trade.
+	if e.config.CooldownPeriod > 0 {
+		e.mu.RLock()
+		lastClose, hasClosed := e.lastClosedTime[symbol]
+		e.mu.RUnlock()
+		if hasClosed && time.Since(lastClose) < e.config.CooldownPeriod {
+			remaining := e.config.CooldownPeriod - time.Since(lastClose)
+			log.Printf("[%s] Cooldown active — skipping (%.0fm remaining)", symbol, remaining.Minutes())
+			return nil
+		}
 	}
 
 	var signal *strategy.Signal
