@@ -73,18 +73,18 @@ type Config struct {
 // DefaultConfig returns default live trading configuration
 func DefaultConfig() Config {
 	return Config{
-		// Optimized symbol list based on LIVE RESULTS (2026-02-09)
-		// Only symbols with positive real PnL or good win rate
+		// Symbol list based on multifactor backtest results (2026-03-05)
+		// Ranked by Sharpe ratio — replaced BTCUSDT (-0.28) and ETHUSDT (0.17)
 		Symbols: []string{
-			"BTCUSDT",       // Live: -2.41 but 50% WR, keep per user request
-			"ETHUSDT",       // Live: -2.91 but 64% WR, good potential
-			"SOLUSDT",       // Live: +2.87, 100% WR - BEST PERFORMER
-			"DOGEUSDT",      // Live: +0.04, 71% WR - profitable
-			"FILUSDT",       // Live: +0.17, 67% WR - profitable
-			// Removed based on live losses: WIFUSDT (-2.19), AAVEUSDT (-0.17)
+			"ENAUSDT",  // Backtest: +21.39% Sharpe 2.60 - BEST
+			"SUIUSDT",  // Backtest: +17.49% Sharpe 2.40
+			"LINKUSDT", // Backtest: +10.26% Sharpe 2.01
+			"FILUSDT",  // Backtest: +9.47%  Sharpe 1.73 - was live profitable
+			"SOLUSDT",  // Backtest: +7.74%  Sharpe 1.45 - was live profitable
+			"DOGEUSDT", // Backtest: +6.04%  Sharpe 1.07 - was live profitable
 		},
 		PositionSizeUSDT:  12,    // Fallback: $12 per trade (was $16)
-		PositionSizePct:   0.08,  // 8% of account balance per trade (was 10%)
+		PositionSizePct:   0.05,  // 5% of account balance per trade (conservative for initial live tests)
 		Leverage:          3,     // Conservative 3x leverage for live trading
 		Interval:          "4h",  // Deprecated: kept for compatibility
 		PrimaryInterval:   "4h",  // Higher TF for trend direction

@@ -29,11 +29,21 @@ type Config struct {
 	ATRTargetMult   float64 // TP distance = ATR * this
 
 	// Regime
-	RequireTrend    bool    // Only trade in trending regimes
-	MinADX          float64 // Minimum ADX to trade
+	RequireTrend bool    // Only trade in trending regimes
+	MinADX       float64 // Minimum ADX to trade
+
+	// Ranging mode (mean-reversion) — for stable pairs like BTC/ETH
+	// When enabled, trades Bollinger Band bounces in ranging markets instead of skipping them.
+	EnableRangingMode    bool    // Activate mean-reversion in ranging regime
+	BollingerPeriod      int     // BB SMA period (20)
+	BollingerStdDev      float64 // BB std-dev multiplier (2.0)
+	RangingRSIOversold   float64 // RSI threshold to enter long in range (32)
+	RangingRSIOverbought float64 // RSI threshold to enter short in range (68)
+	RangingATRStopMult   float64 // SL = ATR * this beyond the touched band (1.0)
 }
 
-// DefaultConfig returns optimized defaults based on walk-forward validation
+// DefaultConfig returns optimized defaults based on walk-forward validation.
+// Used for volatile altcoins (ENAUSDT, SUIUSDT, etc.) — momentum/breakout only.
 func DefaultConfig() Config {
 	return Config{
 		FastEMA:         7,   // Optimized from 9
@@ -48,6 +58,36 @@ func DefaultConfig() Config {
 		ATRTargetMult:   3.3, // Maintain 1.5 R:R ratio (was 2.7)
 		RequireTrend:    true,
 		MinADX:          28,  // Only trade in stronger trends (was 25)
+		// Ranging mode disabled for alts — they have explosive moves, not ranges
+		EnableRangingMode: false,
+	}
+}
+
+// HybridConfig returns a config tuned for stable pairs (BTC, ETH).
+// Combines momentum entries in trending markets with Bollinger Band
+// mean-reversion entries in ranging markets.
+func HybridConfig() Config {
+	return Config{
+		// Trend mode — same as DefaultConfig
+		FastEMA:         7,
+		SlowEMA:         17,
+		RSIPeriod:       14,
+		RSIOverbought:   65,
+		RSIOversold:     35,
+		VolumePeriod:    20,
+		VolumeThreshold: 1.2,
+		ATRPeriod:       14,
+		ATRStopMult:     2.2,
+		ATRTargetMult:   3.3,
+		RequireTrend:    false, // we handle regime routing ourselves
+		MinADX:          28,
+		// Ranging mode — mean-reversion via Bollinger Bands
+		EnableRangingMode:    true,
+		BollingerPeriod:      20,
+		BollingerStdDev:      2.0,
+		RangingRSIOversold:   32, // tighter than trending oversold (35)
+		RangingRSIOverbought: 68, // tighter than trending overbought (65)
+		RangingATRStopMult:   1.0, // SL just beyond the band
 	}
 }
 
@@ -77,7 +117,9 @@ func (s *MultiFactorStrategy) MinimumCandles() int {
 	return max(s.config.SlowEMA, s.config.RSIPeriod, s.config.VolumePeriod, 50) + 10
 }
 
-// Analyze analyzes candles and generates a signal
+// Analyze analyzes candles and generates a signal.
+// Routes to mean-reversion logic in ranging markets (when EnableRangingMode=true)
+// and to momentum logic in trending/high-volatility markets.
 func (s *MultiFactorStrategy) Analyze(candles []model.Candle) (*strategy.Signal, error) {
 	if len(candles) < s.MinimumCandles() {
 		return nil, strategy.ErrInsufficientData
@@ -86,11 +128,25 @@ func (s *MultiFactorStrategy) Analyze(candles []model.Candle) (*strategy.Signal,
 	// Step 1: Detect market regime
 	regime, adx, atr := s.regime.DetectRegime(candles)
 
-	// Step 2: Check if we should trade in this regime
-	if s.config.RequireTrend && regime == RegimeRanging {
+	// Step 2: Route by regime
+	if s.config.EnableRangingMode {
+		// In hybrid mode, try BB mean-reversion first regardless of ADX regime.
+		// We use BB width (not ADX) as the ranging indicator: if bands are not
+		// rapidly expanding (no breakout), price at the band is a reversion candidate.
+		signal, err := s.analyzeRanging(candles, atr)
+		if err == nil {
+			return signal, nil
+		}
+		// No ranging signal — if the regime detector says pure ranging, don't
+		// enter the trending path either (no clean signal in either direction).
+		if regime == RegimeRanging {
+			return nil, strategy.ErrNoSignal
+		}
+	} else if regime == RegimeRanging {
 		return nil, strategy.ErrNoSignal
 	}
 
+	// Trending / high-volatility path — apply ADX filter
 	if adx < s.config.MinADX {
 		return nil, strategy.ErrNoSignal
 	}
@@ -106,7 +162,7 @@ func (s *MultiFactorStrategy) Analyze(candles []model.Candle) (*strategy.Signal,
 	lastSlowEMA := slowEMA[len(slowEMA)-1]
 	lastRSI := rsi[len(rsi)-1]
 
-	// Step 4: Generate signal based on multiple factors
+	// Step 4: Generate momentum signal
 	signal := s.generateSignal(
 		regime,
 		currentPrice,
@@ -123,6 +179,144 @@ func (s *MultiFactorStrategy) Analyze(candles []model.Candle) (*strategy.Signal,
 	}
 
 	return signal, nil
+}
+
+// analyzeRanging generates mean-reversion signals using Bollinger Bands + RSI.
+// Uses BB width (not ADX regime) to detect consolidation: if bands are not
+// rapidly expanding (no breakout in progress), touching a band with an extreme
+// RSI is a reversion entry.
+// TP = middle band (the mean). SL = ATR×RangingATRStopMult beyond the band.
+func (s *MultiFactorStrategy) analyzeRanging(candles []model.Candle, atr float64) (*strategy.Signal, error) {
+	upper, middle, lower := s.calculateBollingerBands(candles, s.config.BollingerPeriod, s.config.BollingerStdDev)
+	if upper == 0 || lower == 0 || middle == 0 {
+		return nil, strategy.ErrNoSignal
+	}
+
+	// Guard: skip if bands are rapidly expanding (breakout in progress).
+	// Compare current width to the average of the last 50 candles.
+	currentWidth := (upper - lower) / middle
+	avgWidth := s.calculateAvgBandWidth(candles, 50)
+	if avgWidth > 0 && currentWidth > avgWidth*1.4 {
+		return nil, strategy.ErrNoSignal // bands expanding = directional move, not a range
+	}
+
+	rsi := s.calculateRSI(candles, s.config.RSIPeriod)
+	lastRSI := rsi[len(rsi)-1]
+	price := candles[len(candles)-1].Close
+	lastCandle := candles[len(candles)-1]
+	prevCandle := candles[len(candles)-2]
+
+	// Trend direction filter: use 100-period EMA to determine bias.
+	// Only take mean-reversion entries aligned with the macro trend to avoid
+	// shorting bull-market upper-band breakouts or longing bear-market breakdowns.
+	longBias, shortBias := s.calcTrendBias(candles, 100)
+
+	// LONG: price at/below lower band + RSI oversold + bullish candle reversal + trend allows longs
+	nearLower := price <= lower*1.005
+	longConfirm := lastCandle.Close > lastCandle.Open || prevCandle.Close > prevCandle.Open
+	if nearLower && lastRSI < s.config.RangingRSIOversold && longConfirm && longBias {
+		sl := lower - atr*s.config.RangingATRStopMult
+		return &strategy.Signal{
+			Type:       strategy.SignalBuy,
+			Symbol:     s.symbol,
+			Price:      price,
+			SL:         sl,
+			TP:         middle,
+			Confidence: 0.70,
+			Reason: fmt.Sprintf("Range-reversion LONG: RSI=%.1f at lower BB (%.4f → mid %.4f)",
+				lastRSI, lower, middle),
+		}, nil
+	}
+
+	// SHORT: price at/above upper band + RSI overbought + bearish candle reversal + trend allows shorts
+	nearUpper := price >= upper*0.995
+	shortConfirm := lastCandle.Close < lastCandle.Open || prevCandle.Close < prevCandle.Open
+	if nearUpper && lastRSI > s.config.RangingRSIOverbought && shortConfirm && shortBias {
+		sl := upper + atr*s.config.RangingATRStopMult
+		return &strategy.Signal{
+			Type:       strategy.SignalSell,
+			Symbol:     s.symbol,
+			Price:      price,
+			SL:         sl,
+			TP:         middle,
+			Confidence: 0.70,
+			Reason: fmt.Sprintf("Range-reversion SHORT: RSI=%.1f at upper BB (%.4f → mid %.4f)",
+				lastRSI, upper, middle),
+		}, nil
+	}
+
+	return nil, strategy.ErrNoSignal
+}
+
+// calcTrendBias returns (allowLong, allowShort) based on the 100-period EMA slope.
+// Price above EMA = bullish bias (allow longs, block shorts).
+// Price below EMA = bearish bias (allow shorts, block longs).
+// Within 1% of EMA = neutral (allow both).
+func (s *MultiFactorStrategy) calcTrendBias(candles []model.Candle, emaPeriod int) (longBias, shortBias bool) {
+	if len(candles) < emaPeriod {
+		return true, true // not enough data — allow both
+	}
+	emaVals := s.calculateEMA(candles, emaPeriod)
+	longEMA := emaVals[len(emaVals)-1]
+	price := candles[len(candles)-1].Close
+	pct := (price - longEMA) / longEMA
+	if pct > 0.01 { // price >1% above EMA → bull bias
+		return true, false
+	}
+	if pct < -0.01 { // price >1% below EMA → bear bias
+		return false, true
+	}
+	return true, true // neutral zone
+}
+
+// calculateAvgBandWidth calculates the average (upper-lower)/middle BB width
+// over the last N candles — used to detect band expansion (breakouts).
+func (s *MultiFactorStrategy) calculateAvgBandWidth(candles []model.Candle, lookback int) float64 {
+	if len(candles) < s.config.BollingerPeriod+lookback {
+		return 0
+	}
+	var widths []float64
+	start := len(candles) - lookback
+	for i := start; i < len(candles); i++ {
+		u, m, l := s.calculateBollingerBands(candles[:i+1], s.config.BollingerPeriod, s.config.BollingerStdDev)
+		if m > 0 {
+			widths = append(widths, (u-l)/m)
+		}
+	}
+	if len(widths) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, w := range widths {
+		sum += w
+	}
+	return sum / float64(len(widths))
+}
+
+// calculateBollingerBands returns upper, middle (SMA), and lower Bollinger Bands.
+func (s *MultiFactorStrategy) calculateBollingerBands(candles []model.Candle, period int, stdDevMult float64) (upper, middle, lower float64) {
+	if len(candles) < period {
+		return 0, 0, 0
+	}
+
+	recent := candles[len(candles)-period:]
+
+	sum := 0.0
+	for _, c := range recent {
+		sum += c.Close
+	}
+	middle = sum / float64(period)
+
+	variance := 0.0
+	for _, c := range recent {
+		diff := c.Close - middle
+		variance += diff * diff
+	}
+	stdDev := math.Sqrt(variance / float64(period))
+
+	upper = middle + stdDevMult*stdDev
+	lower = middle - stdDevMult*stdDev
+	return
 }
 
 func (s *MultiFactorStrategy) generateSignal(
