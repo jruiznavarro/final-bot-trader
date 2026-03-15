@@ -67,17 +67,27 @@ func (c *Client) SendMessage(message string) error {
 }
 
 // NotifyStartup sends a startup notification
-func (c *Client) NotifyStartup(mode string, positionSize float64, leverage int) error {
+func (c *Client) NotifyStartup(mode string, positionSizePct float64, leverage int, symbols []string, primaryInterval, entryInterval string, maxDailyLoss float64, maxOpenPositions int) error {
+	symbolList := ""
+	for _, s := range symbols {
+		symbolList += "• " + s + "\n"
+	}
+
 	msg := fmt.Sprintf(`<b>%s</b>
 
 ✅ <b>Bot Iniciado</b>
 
 📊 <b>Configuración:</b>
-• Modo: %s
-• Tamaño posición: $%.2f USDT
-• Apalancamiento: %dx
+• Modo: <b>%s</b>
+• Tamaño posición: <code>%.0f%% del balance</code>
+• Apalancamiento: <code>%dx</code>
+• Estrategia: <code>MTF %s + %s</code>
+• Máx. posiciones: <code>%d</code>
+• Límite pérdida diaria: <code>$%.0f</code>
 
-Monitoreando señales de trading...`, botName, mode, positionSize, leverage)
+📋 <b>Símbolos (%d):</b>
+%s
+Monitoreando señales...`, botName, mode, positionSizePct*100, leverage, primaryInterval, entryInterval, maxOpenPositions, maxDailyLoss, len(symbols), symbolList)
 
 	return c.SendMessage(msg)
 }

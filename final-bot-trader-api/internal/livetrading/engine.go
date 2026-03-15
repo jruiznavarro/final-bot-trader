@@ -1023,7 +1023,7 @@ func (e *Engine) NotifyStartup() {
 	if e.config.DryRun {
 		mode = "DRY RUN"
 	}
-	if err := e.telegram.NotifyStartup(mode, e.config.PositionSizeUSDT, e.config.Leverage); err != nil {
+	if err := e.telegram.NotifyStartup(mode, e.config.PositionSizePct, e.config.Leverage, e.config.Symbols, e.config.PrimaryInterval, e.config.EntryInterval, e.config.MaxDailyLoss, e.config.MaxOpenPositions); err != nil {
 		log.Printf("Telegram startup notification error: %v", err)
 	}
 }
