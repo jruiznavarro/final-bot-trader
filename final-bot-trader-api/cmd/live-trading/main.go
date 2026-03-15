@@ -52,7 +52,7 @@ func main() {
 	// Create configuration
 	config := livetrading.DefaultConfig()
 	config.PositionSizeUSDT = 10   // Minimum: $10 per trade
-	config.Leverage = 5            // 5x leverage
+	config.Leverage = 3            // 3x leverage (conservative)
 	config.MaxDailyLoss = 50       // Stop if losing $50/day
 	config.MaxDailyTrades = 20     // Max 20 trades/day
 	config.MaxOpenPositions = 3    // Max 3 positions at once
