@@ -336,6 +336,16 @@ func (s *MultiFactorStrategy) generateSignal(
 	var signalType strategy.SignalType
 	var stopLoss, takeProfit float64
 
+	// Macro trend filter: 50-period EMA determines the dominant direction.
+	// Block LONGs when price is more than 2% below the 50-EMA (sustained downtrend)
+	// and block SHORTs when price is more than 2% above it (sustained uptrend).
+	// This prevents entering counter-trend on dead-cat bounces or bull-market dips.
+	macroEMA := s.calculateEMA(candles, 50)
+	lastMacroEMA := macroEMA[len(macroEMA)-1]
+	macroPct := (price - lastMacroEMA) / lastMacroEMA
+	macroAllowLong := macroPct > -0.02  // price not more than 2% below 50-EMA
+	macroAllowShort := macroPct < 0.02  // price not more than 2% above 50-EMA
+
 	// LONG conditions - now includes momentum check
 	longConditions := []bool{
 		regime == RegimeTrendingUp || regime == RegimeHighVolatility,
@@ -344,6 +354,7 @@ func (s *MultiFactorStrategy) generateSignal(
 		rsi > 40 && rsi < s.config.RSIOverbought, // RSI not overbought
 		s.isHigherLow(candles),         // Structure confirmation
 		recentMomentum >= 0,            // Don't go long if price falling
+		macroAllowLong,                 // Price not deep below 50-EMA (no LONG in crashes)
 	}
 
 	// SHORT conditions - now includes momentum check
@@ -354,13 +365,17 @@ func (s *MultiFactorStrategy) generateSignal(
 		rsi < 60 && rsi > s.config.RSIOversold, // RSI not oversold
 		s.isLowerHigh(candles),         // Structure confirmation
 		recentMomentum <= 0,            // Don't go short if price rising
+		macroAllowShort,                // Price not deep above 50-EMA (no SHORT in rallies)
 	}
 
 	longScore := countTrue(longConditions)
 	shortScore := countTrue(shortConditions)
 
-	// Require at least 5 out of 6 conditions (including momentum)
-	minScore := 5
+	// Require at least 6 out of 7 conditions.
+	// The macro-EMA filter is condition 7 and acts as a hard gate: if price is
+	// deep against the 50-EMA, that condition alone drops the score below the
+	// threshold even if all other 6 are met.
+	minScore := 6
 
 	if longScore >= minScore && longScore > shortScore {
 		signalType = strategy.SignalBuy
@@ -374,9 +389,7 @@ func (s *MultiFactorStrategy) generateSignal(
 		return nil
 	}
 
-	// Calculate position size based on risk
-	// (This will be refined by risk manager)
-	confidence := float64(max(longScore, shortScore)) / 6.0
+	confidence := float64(max(longScore, shortScore)) / 7.0
 
 	return &strategy.Signal{
 		Type:       signalType,
@@ -385,7 +398,7 @@ func (s *MultiFactorStrategy) generateSignal(
 		SL:         stopLoss,
 		TP:         takeProfit,
 		Confidence: confidence,
-		Reason:     fmt.Sprintf("Regime: %s, RSI: %.1f, Momentum: %.2f%%, Score: %d/6", regime, rsi, recentMomentum*100, max(longScore, shortScore)),
+		Reason:     fmt.Sprintf("Regime: %s, RSI: %.1f, Momentum: %.2f%%, Score: %d/7", regime, rsi, recentMomentum*100, max(longScore, shortScore)),
 	}
 }
 
@@ -406,13 +419,14 @@ func (s *MultiFactorStrategy) calculateRecentMomentum(candles []model.Candle, pe
 	return (currentClose - pastClose) / pastClose
 }
 
-// isHigherLow checks if recent price action shows higher lows (bullish)
+// isHigherLow checks if recent price action shows higher lows (bullish).
+// Uses 20 candles (80h on 4h TF) for a more stable structural read.
 func (s *MultiFactorStrategy) isHigherLow(candles []model.Candle) bool {
-	if len(candles) < 10 {
+	if len(candles) < 20 {
 		return false
 	}
 
-	recent := candles[len(candles)-10:]
+	recent := candles[len(candles)-20:]
 
 	// Find two recent swing lows
 	var swingLows []float64
@@ -430,18 +444,19 @@ func (s *MultiFactorStrategy) isHigherLow(candles []model.Candle) bool {
 	}
 
 	// Fallback: compare first half low to second half low
-	firstHalf := recent[:5]
-	secondHalf := recent[5:]
+	firstHalf := recent[:10]
+	secondHalf := recent[10:]
 	return minLow(secondHalf) > minLow(firstHalf)*0.99
 }
 
-// isLowerHigh checks if recent price action shows lower highs (bearish)
+// isLowerHigh checks if recent price action shows lower highs (bearish).
+// Uses 20 candles (80h on 4h TF) for a more stable structural read.
 func (s *MultiFactorStrategy) isLowerHigh(candles []model.Candle) bool {
-	if len(candles) < 10 {
+	if len(candles) < 20 {
 		return false
 	}
 
-	recent := candles[len(candles)-10:]
+	recent := candles[len(candles)-20:]
 
 	// Find two recent swing highs
 	var swingHighs []float64
@@ -459,8 +474,8 @@ func (s *MultiFactorStrategy) isLowerHigh(candles []model.Candle) bool {
 	}
 
 	// Fallback: compare first half high to second half high
-	firstHalf := recent[:5]
-	secondHalf := recent[5:]
+	firstHalf := recent[:10]
+	secondHalf := recent[10:]
 	return maxHigh(secondHalf) < maxHigh(firstHalf)*1.01
 }
 

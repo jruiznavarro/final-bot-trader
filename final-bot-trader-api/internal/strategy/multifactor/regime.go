@@ -37,6 +37,7 @@ type RegimeDetector struct {
 	ADXTrendThreshold float64 // ADX > this = trending
 	ADXRangeThreshold float64 // ADX < this = ranging
 	VolatilityMult   float64 // ATR > avg * this = high vol
+	MinDIMargin      float64 // +DI and -DI must differ by at least this to declare a direction
 }
 
 // DefaultRegimeDetector returns a detector with sensible defaults
@@ -46,6 +47,7 @@ func DefaultRegimeDetector() *RegimeDetector {
 		ADXTrendThreshold: 25,
 		ADXRangeThreshold: 20,
 		VolatilityMult:   1.5,
+		MinDIMargin:      5.0, // require 5-point DI gap to avoid flip-flops during bounces
 	}
 }
 
@@ -67,12 +69,21 @@ func (d *RegimeDetector) DetectRegime(candles []model.Candle) (MarketRegime, flo
 		return RegimeHighVolatility, adx, atr
 	}
 
-	// Check for trending vs ranging
+	// Check for trending vs ranging.
+	// Require a minimum DI margin to avoid flip-flopping between TRENDING_UP and
+	// TRENDING_DOWN during brief counter-trend bounces (e.g. dead-cat bounces in
+	// a crash). Without a margin, a 0.1-point DI crossover on a 4h bounce is
+	// enough to declare TRENDING_UP and trigger a losing LONG.
 	if adx > d.ADXTrendThreshold {
-		if plusDI > minusDI {
+		if plusDI > minusDI+d.MinDIMargin {
 			return RegimeTrendingUp, adx, atr
 		}
-		return RegimeTrendingDown, adx, atr
+		if minusDI > plusDI+d.MinDIMargin {
+			return RegimeTrendingDown, adx, atr
+		}
+		// DI values are within margin: strong trend exists but direction is
+		// ambiguous (transition/squeeze). Treat as ranging to avoid bad entries.
+		return RegimeRanging, adx, atr
 	}
 
 	if adx < d.ADXRangeThreshold {

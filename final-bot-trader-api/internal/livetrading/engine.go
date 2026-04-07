@@ -73,15 +73,16 @@ type Config struct {
 // DefaultConfig returns default live trading configuration
 func DefaultConfig() Config {
 	return Config{
-		// Symbol list based on multifactor backtest results (2026-03-05)
-		// Ranked by Sharpe ratio — replaced BTCUSDT (-0.28) and ETHUSDT (0.17)
+		// Symbol list based on multifactor backtest + live performance (2026-04-07)
+		// LINKUSDT removed: 23% live win rate, -3.21 USDT in 23 days (worst by far)
+		// AAVEUSDT added: +3.41% backtest return, 48.5% WR, MaxDD 1.5%
 		Symbols: []string{
-			"ENAUSDT",  // Backtest: +21.39% Sharpe 2.60 - BEST
-			"SUIUSDT",  // Backtest: +17.49% Sharpe 2.40
-			"LINKUSDT", // Backtest: +10.26% Sharpe 2.01
-			"FILUSDT",  // Backtest: +9.47%  Sharpe 1.73 - was live profitable
-			"SOLUSDT",  // Backtest: +7.74%  Sharpe 1.45 - was live profitable
-			"DOGEUSDT", // Backtest: +6.04%  Sharpe 1.07 - was live profitable
+			"ENAUSDT",  // Live: 61.5% WR +0.25 USDT | Backtest: +3.41% Sharpe 234
+			"SUIUSDT",  // Live: 41.2% WR +0.39 USDT | Backtest: +5.63% Sharpe 372
+			"AAVEUSDT", // Live: N/A (new)           | Backtest: +3.41% Sharpe 234
+			"FILUSDT",  // Live: 60.0% WR +2.40 USDT | Backtest: +2.35% Sharpe 168
+			"SOLUSDT",  // Live: 35.7% WR +0.74 USDT | Backtest: -1.39% (watch)
+			"DOGEUSDT", // Live: 62.5% WR +1.09 USDT | Backtest: +0.59% Sharpe 42
 		},
 		PositionSizeUSDT:  12,    // Fallback: $12 per trade (was $16)
 		PositionSizePct:   0.05,  // 5% of account balance per trade (conservative for initial live tests)
@@ -142,7 +143,7 @@ func NewEngine(client *exchange.BitunixClient, tg *telegram.Client, config Confi
 		EntryInterval:         config.EntryInterval,
 		StrategyConfig:        stratConfig,
 		RequireTrendAlignment: true,
-		MinPrimaryADX:         20,
+		MinPrimaryADX:         25, // raised from 20: only trade in confirmed trends
 	}
 
 	for _, symbol := range config.Symbols {
@@ -184,9 +185,69 @@ func (e *Engine) LoadState() error {
 	}
 
 	e.mu.Lock()
+	if err := json.Unmarshal(data, e.state); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	e.mu.Unlock()
+
+	e.ReconcileState()
+	return nil
+}
+
+// ReconcileState repairs the state aggregates (TotalPnL, WinCount, LossCount) by
+// recomputing them from scratch from the closed trades list. It also assigns an
+// estimated exit price to any closed trade that is missing one, using the
+// recorded TP/SL levels as the source of truth.
+func (e *Engine) ReconcileState() {
+	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	return json.Unmarshal(data, e.state)
+	var totalPnL float64
+	var wins, losses int
+
+	for i := range e.state.Trades {
+		t := &e.state.Trades[i]
+		if t.Status != "CLOSED" {
+			continue
+		}
+
+		// Repair trades that were closed without an exit price (legacy state).
+		if t.ExitPrice == 0 && (t.StopLoss > 0 || t.TakeProfit > 0) {
+			isLong := t.Side == "LONG"
+			// Without current market price we cannot determine TP vs SL.
+			// Default to Stop Loss (conservative: assume worst case).
+			if t.StopLoss > 0 {
+				t.ExitPrice = t.StopLoss
+				t.ExitReason = "Stop Loss hit (estimated)"
+			} else {
+				t.ExitPrice = t.TakeProfit
+				t.ExitReason = "Take Profit hit (estimated)"
+			}
+			if isLong {
+				t.PnL = (t.ExitPrice - t.EntryPrice) * t.Quantity
+			} else {
+				t.PnL = (t.EntryPrice - t.ExitPrice) * t.Quantity
+			}
+			log.Printf("[%s] Reconciled missing PnL: exit=%.6f pnl=%.4f", t.Symbol, t.ExitPrice, t.PnL)
+		}
+
+		totalPnL += t.PnL
+		if t.PnL >= 0 {
+			wins++
+		} else {
+			losses++
+		}
+	}
+
+	if wins+losses > 0 {
+		log.Printf("State reconciled: %d closed trades | PnL: %+.4f | W/L: %d/%d",
+			wins+losses, totalPnL, wins, losses)
+	}
+
+	e.state.TotalPnL = totalPnL
+	e.state.WinCount = wins
+	e.state.LossCount = losses
 }
 
 // SaveState saves trading state to file
