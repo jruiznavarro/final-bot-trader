@@ -189,7 +189,7 @@ func runMTFBacktest(symbol string, candles []model.Candle, initialBalance, posit
 
 		// Simulate MTF by using the same candles for both timeframes
 		// In reality, we would have separate 1h candles
-		signal, err := mtfStrategy.AnalyzeMTF(historyCandles, historyCandles)
+		signal, err := mtfStrategy.AnalyzeMTF(historyCandles, historyCandles, nil)
 		if err != nil || signal == nil {
 			continue
 		}

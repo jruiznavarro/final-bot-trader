@@ -487,7 +487,14 @@ func (s *MultiFactorStrategy) calculateEMA(candles []model.Candle, period int) [
 	return ema(closes, period)
 }
 
-func (s *MultiFactorStrategy) calculateRSI(candles []model.Candle, period int) []float64 {
+// LastRSI returns the most recent RSI value for the given candles and period.
+// Used externally (e.g., daily RSI filter in MTFStrategy).
+func LastRSI(candles []model.Candle, period int) float64 {
+	vals := calcRSI(candles, period)
+	return vals[len(vals)-1]
+}
+
+func calcRSI(candles []model.Candle, period int) []float64 {
 	if len(candles) < period+1 {
 		return []float64{50}
 	}
@@ -519,6 +526,10 @@ func (s *MultiFactorStrategy) calculateRSI(candles []model.Candle, period int) [
 	}
 
 	return rsi
+}
+
+func (s *MultiFactorStrategy) calculateRSI(candles []model.Candle, period int) []float64 {
+	return calcRSI(candles, period)
 }
 
 func (s *MultiFactorStrategy) calculateVolumeRatio(candles []model.Candle, period int) float64 {

@@ -78,10 +78,15 @@ func (s *MTFStrategy) Name() string {
 	return fmt.Sprintf("MTF(%s+%s)", s.config.PrimaryInterval, s.config.EntryInterval)
 }
 
-// AnalyzeMTF analyzes both timeframes and generates a signal
+// AnalyzeMTF analyzes both timeframes and generates a signal.
 // primaryCandles: 4h candles for trend direction
-// entryCandles: 1h candles for entry timing
-func (s *MTFStrategy) AnalyzeMTF(primaryCandles, entryCandles []model.Candle) (*strategy.Signal, error) {
+// entryCandles:   1h candles for entry timing
+// dailyCandles:   1d candles for macro RSI filter (nil/empty to skip)
+//
+// Daily RSI filter: if the daily RSI < 38, the market is oversold on the
+// daily chart and a bounce is likely — SHORT entries are blocked to avoid
+// being caught short at a local bottom during a recovery.
+func (s *MTFStrategy) AnalyzeMTF(primaryCandles, entryCandles, dailyCandles []model.Candle) (*strategy.Signal, error) {
 	if len(primaryCandles) < 50 {
 		return nil, strategy.ErrInsufficientData
 	}
@@ -130,6 +135,17 @@ func (s *MTFStrategy) AnalyzeMTF(primaryCandles, entryCandles []model.Candle) (*
 
 		// Only trade if entry signal aligns with primary trend
 		if signalDir != primaryDir {
+			return nil, strategy.ErrNoSignal
+		}
+	}
+
+	// Step 4: Daily RSI filter — block SHORTs when daily RSI < 38.
+	// A deeply oversold daily chart means the market is exhausted to the downside
+	// and prone to sharp bounces. Entering SHORTs at those levels leads to being
+	// stopped out by the recovery (root cause of April 12-13 losses).
+	if entrySignal.Type == strategy.SignalSell && len(dailyCandles) >= 15 {
+		dailyRSI := LastRSI(dailyCandles, 14)
+		if dailyRSI < 38 {
 			return nil, strategy.ErrNoSignal
 		}
 	}

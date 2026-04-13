@@ -65,24 +65,23 @@ func (r *TradeRepository) Create(ctx context.Context, trade *Trade) error {
 	return err
 }
 
-// Update updates an existing trade
+// Update updates an existing trade. entry_price is intentionally excluded
+// because it is set once at open and must never be overwritten on close.
 func (r *TradeRepository) Update(ctx context.Context, trade *Trade) error {
 	query := `
 		UPDATE trades SET
-			entry_price = $2,
-			exit_price = $3,
-			pnl = $4,
-			status = $5,
-			exit_reason = $6,
-			exit_time = $7,
-			position_id = $8,
+			exit_price = $2,
+			pnl = $3,
+			status = $4,
+			exit_reason = $5,
+			exit_time = $6,
+			position_id = $7,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1
 	`
 
 	_, err := r.db.ExecContext(ctx, query,
 		trade.ID,
-		trade.EntryPrice,
 		trade.ExitPrice,
 		trade.PnL,
 		trade.Status,

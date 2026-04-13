@@ -683,11 +683,20 @@ func (e *Engine) analyzeMultiTimeframe(ctx context.Context, symbol string) (*str
 		return nil, 0, fmt.Errorf("insufficient entry candles: %d", len(entryCandles))
 	}
 
+	time.Sleep(100 * time.Millisecond)
+
+	// Get daily candles for the macro RSI oversold filter (best-effort: non-fatal if missing)
+	dailyCandles, err := e.client.GetKlines(ctx, symbol, "1d", 30, 0, 0)
+	if err != nil {
+		log.Printf("[%s] Warning: could not fetch daily candles for RSI filter: %v", symbol, err)
+		dailyCandles = nil
+	}
+
 	currentPrice := entryCandles[len(entryCandles)-1].Close
 
 	// Use MTF strategy
 	mtfStrat := e.mtfStrategies[symbol]
-	signal, err := mtfStrat.AnalyzeMTF(primaryCandles, entryCandles)
+	signal, err := mtfStrat.AnalyzeMTF(primaryCandles, entryCandles, dailyCandles)
 	if err != nil {
 		return nil, 0, err
 	}
