@@ -16,6 +16,22 @@ const (
 	MarginModeCross    MarginMode = "CROSS"
 )
 
+// HistoryPosition represents a closed position from the exchange's history,
+// including the exchange-reported realized PnL, fees and funding.
+type HistoryPosition struct {
+	PositionID  string  // Unique position identifier
+	Symbol      string
+	Side        string  // LONG or SHORT
+	MaxQty      float64 // Maximum quantity held
+	EntryPrice  float64 // Average entry price
+	ClosePrice  float64 // Average close price
+	RealizedPnL float64 // Exchange-reported realized PnL (net of fees and funding)
+	Fee         float64 // Total trading fees paid (negative or positive per exchange convention)
+	Funding     float64 // Total funding paid/received
+	CreateTime  int64   // Position open time (ms)
+	CloseTime   int64   // Position close time (ms)
+}
+
 // Position represents an open trading position
 type Position struct {
 	PositionID    string  // Unique position identifier

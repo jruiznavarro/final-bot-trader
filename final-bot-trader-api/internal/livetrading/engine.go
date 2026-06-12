@@ -47,6 +47,10 @@ type Trade struct {
 	ExitTime      time.Time `json:"exit_time,omitempty"`
 	PnL           float64   `json:"pnl,omitempty"`
 	ExitReason    string    `json:"exit_reason,omitempty"`
+	// Trailing stop progress, persisted so a bot restart does not reset the
+	// trail (StopLoss holds the current trail level once TrailActive is set).
+	TrailActive   bool      `json:"trail_active,omitempty"`
+	TrailBest     float64   `json:"trail_best,omitempty"`
 }
 
 // TradingState holds the current trading state
@@ -79,7 +83,9 @@ type Config struct {
 	MaxOpenPositions  int           // Max simultaneous positions
 	CooldownPeriod    time.Duration // Min time between closing and re-entering same symbol
 	UseFixedTP        bool          // If true, place a fixed TP order; if false, exit via trailing stop + SL only
-	DryRun            bool          // If true, log signals but don't execute
+	MaxSameDirection  int           // Max simultaneous positions on the same side (0 = no limit)
+	FundingExtremeRate float64      // Skip entry if funding against position exceeds this per-8h rate (0 = disabled)
+	DryRun            bool          // If true, record paper trades and simulate exits (no real orders)
 }
 
 // DefaultConfig returns default live trading configuration
@@ -119,6 +125,8 @@ func DefaultConfig() Config {
 		// Trailing-only exits (act 4%, trail 1.5%) + hard SL: PF 1.08 -> 1.39,
 		// PnL +104 -> +525 USDT. Winners must run; the SL still caps losses.
 		UseFixedTP:        false,
+		MaxSameDirection:  2,      // 3 alts long at once = one bet at 3x risk; cap at 2 per side
+		FundingExtremeRate: 0.001, // skip entries paying >0.1%/8h funding against the position
 		DryRun:            false,
 	}
 }
@@ -335,19 +343,25 @@ func (e *Engine) Run(ctx context.Context) error {
 		intervalDuration = parseInterval(e.config.Interval)
 	}
 
-	ticker := time.NewTicker(intervalDuration)
-	defer ticker.Stop()
-
-	// Run immediately
+	// Run immediately on startup, then align every cycle to the candle close
+	// (UTC boundary + 30s margin). Running mid-candle evaluates an incomplete
+	// last candle whose signal can appear and vanish before the close (repaint).
 	e.processAllSymbols(ctx)
 
 	for {
+		now := time.Now().UTC()
+		nextRun := now.Truncate(intervalDuration).Add(intervalDuration).Add(30 * time.Second)
+		timer := time.NewTimer(nextRun.Sub(now))
+		log.Printf("Next cycle aligned to candle close: %s", nextRun.Format("2006-01-02 15:04:05 MST"))
+
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
 		case <-e.stopCh:
+			timer.Stop()
 			return nil
-		case <-ticker.C:
+		case <-timer.C:
 			e.processAllSymbols(ctx)
 		}
 	}
@@ -376,8 +390,14 @@ func (e *Engine) processAllSymbols(ctx context.Context) {
 		return
 	}
 
-	// Sync positions with exchange
-	e.syncPositions(ctx)
+	if e.config.DryRun {
+		// Dry run: no exchange positions to sync. Simulate exits for the
+		// recorded paper trades using the last closed 4h candle instead.
+		e.simulateDryRunExits(ctx)
+	} else {
+		// Sync positions with exchange
+		e.syncPositions(ctx)
+	}
 
 	for _, symbol := range e.config.Symbols {
 		if err := e.processSymbol(ctx, symbol); err != nil {
@@ -539,8 +559,15 @@ func (e *Engine) syncPositions(ctx context.Context) {
 	}
 }
 
-// calculateClosedTradePnL determines the exit price, PnL and reason for a closed trade
+// calculateClosedTradePnL determines the exit price, PnL and reason for a closed trade.
+// It first asks the exchange for the real closed-position record (realizedPNL is net
+// of fees and funding); only if that lookup fails does it fall back to estimating
+// the exit from the recorded TP/SL levels.
 func (e *Engine) calculateClosedTradePnL(ctx context.Context, trade *Trade) (exitPrice, pnl float64, reason string) {
+	if exitPrice, pnl, reason, ok := e.lookupRealClosedPnL(ctx, trade); ok {
+		return exitPrice, pnl, reason
+	}
+
 	// Get current price as best approximation of exit price
 	currentPrice, err := e.client.GetPrice(ctx, trade.Symbol)
 	if err != nil {
@@ -596,6 +623,211 @@ func (e *Engine) calculateClosedTradePnL(ctx context.Context, trade *Trade) (exi
 		trade.Symbol, trade.EntryPrice, exitPrice, trade.Quantity, pnl, reason)
 
 	return exitPrice, pnl, reason
+}
+
+// simulateDryRunExits replays the exit logic (gap / trailing / hard SL) for open
+// paper trades against the last CLOSED 4h candle — the same bar-by-bar semantics
+// validated in backtest-v2. This makes dry-run results directly comparable with
+// both the backtest and live trading.
+func (e *Engine) simulateDryRunExits(ctx context.Context) {
+	open := e.GetOpenTrades()
+	if len(open) == 0 {
+		return
+	}
+
+	tsConfig := DefaultTrailingStopConfig()
+
+	for _, trade := range open {
+		candles, err := e.client.GetKlines(ctx, trade.Symbol, "4h", 3, 0, 0)
+		if err != nil || len(candles) == 0 {
+			log.Printf("[%s] DRY: could not fetch candles for exit simulation: %v", trade.Symbol, err)
+			continue
+		}
+		closed := dropIncompleteCandle(candles, 4*time.Hour)
+		if len(closed) == 0 {
+			continue
+		}
+		bar := closed[len(closed)-1]
+
+		// Only evaluate bars that overlap the trade's lifetime
+		if !bar.CloseTime.After(trade.EntryTime) {
+			continue
+		}
+
+		isLong := trade.Side == "LONG"
+		sl := trade.StopLoss
+
+		// 1) gap through SL at the bar open
+		if (isLong && bar.Open <= sl) || (!isLong && bar.Open >= sl) {
+			reason := "Stop Loss (gap)"
+			if trade.TrailActive {
+				reason = "Trailing stop"
+			}
+			e.closeSimulatedTrade(trade.ID, bar.Open, reason)
+			continue
+		}
+		// 2) trailing level / hard SL touched within the bar
+		if (isLong && bar.Low <= sl) || (!isLong && bar.High >= sl) {
+			reason := "Stop Loss hit"
+			if trade.TrailActive {
+				reason = "Trailing stop"
+			}
+			e.closeSimulatedTrade(trade.ID, sl, reason)
+			continue
+		}
+		// 3) fixed TP (only when configured)
+		if e.config.UseFixedTP && trade.TakeProfit > 0 &&
+			((isLong && bar.High >= trade.TakeProfit) || (!isLong && bar.Low <= trade.TakeProfit)) {
+			e.closeSimulatedTrade(trade.ID, trade.TakeProfit, "Take Profit hit")
+			continue
+		}
+
+		// No exit: update trailing state with the bar's extreme
+		ext := bar.High
+		profitPct := (ext - trade.EntryPrice) / trade.EntryPrice * 100
+		if !isLong {
+			ext = bar.Low
+			profitPct = (trade.EntryPrice - ext) / trade.EntryPrice * 100
+		}
+		if !trade.TrailActive {
+			if profitPct >= tsConfig.ActivationPct {
+				level := ext * (1 - tsConfig.TrailPct/100)
+				if !isLong {
+					level = ext * (1 + tsConfig.TrailPct/100)
+				}
+				e.UpdateTradeTrailing(trade.ID, ext, level)
+				log.Printf("[%s] DRY: trailing activated at %.2f%% (best %.6f, trail %.6f)",
+					trade.Symbol, profitPct, ext, level)
+			}
+		} else if (isLong && ext > trade.TrailBest) || (!isLong && ext < trade.TrailBest) {
+			level := ext * (1 - tsConfig.TrailPct/100)
+			if !isLong {
+				level = ext * (1 + tsConfig.TrailPct/100)
+			}
+			if (isLong && level > sl) || (!isLong && level < sl) {
+				e.UpdateTradeTrailing(trade.ID, ext, level)
+				log.Printf("[%s] DRY: trailing moved to %.6f", trade.Symbol, level)
+			}
+		}
+	}
+}
+
+// closeSimulatedTrade closes a paper trade at the given price, net of estimated
+// round-trip taker fees, updating totals, circuit breaker and notifications.
+func (e *Engine) closeSimulatedTrade(tradeID string, exitPrice float64, reason string) {
+	e.mu.Lock()
+	var trade *Trade
+	for i := range e.state.Trades {
+		if e.state.Trades[i].ID == tradeID && e.state.Trades[i].Status == "OPEN" {
+			trade = &e.state.Trades[i]
+			break
+		}
+	}
+	if trade == nil {
+		e.mu.Unlock()
+		return
+	}
+
+	isLong := trade.Side == "LONG"
+	var pnl float64
+	if isLong {
+		pnl = (exitPrice - trade.EntryPrice) * trade.Quantity
+	} else {
+		pnl = (trade.EntryPrice - exitPrice) * trade.Quantity
+	}
+	pnl -= estimatedFees(trade.EntryPrice, exitPrice, trade.Quantity)
+
+	now := time.Now()
+	trade.Status = "CLOSED"
+	trade.ExitPrice = exitPrice
+	trade.ExitTime = now
+	trade.PnL = pnl
+	trade.ExitReason = reason + " (simulated)"
+
+	e.state.TotalPnL += pnl
+	e.state.DailyPnL += pnl
+	if pnl >= 0 {
+		e.state.WinCount++
+	} else {
+		e.state.LossCount++
+	}
+	e.lastClosedTime[trade.Symbol] = now
+	symbol, side, entry := trade.Symbol, trade.Side, trade.EntryPrice
+	e.mu.Unlock()
+
+	log.Printf("[%s] DRY: trade closed: entry=%.6f exit=%.6f pnl=%+.4f reason=%s",
+		symbol, entry, exitPrice, pnl, reason)
+
+	if e.circuitBreaker != nil {
+		e.circuitBreaker.RecordTrade(pnl)
+	}
+	if e.telegram != nil {
+		if pnl >= 0 {
+			e.telegram.NotifyTPHit(symbol, side, entry, exitPrice, pnl)
+		} else {
+			e.telegram.NotifySLHit(symbol, side, entry, exitPrice, pnl)
+		}
+	}
+}
+
+// dropIncompleteCandle removes the last candle if it has not closed yet
+// (exchanges include the in-progress candle in kline responses).
+func dropIncompleteCandle(candles []model.Candle, interval time.Duration) []model.Candle {
+	if len(candles) == 0 {
+		return candles
+	}
+	last := candles[len(candles)-1]
+	if last.OpenTime.Add(interval).After(time.Now()) {
+		return candles[:len(candles)-1]
+	}
+	return candles
+}
+
+// lookupRealClosedPnL fetches the closed position from the exchange history and
+// returns the real close price and realized PnL (net of fees and funding).
+// Matching: by PositionID when known, otherwise by symbol+side with an open time
+// within 5 minutes of the trade's entry time.
+func (e *Engine) lookupRealClosedPnL(ctx context.Context, trade *Trade) (exitPrice, pnl float64, reason string, ok bool) {
+	history, err := e.client.GetHistoryPositions(ctx, trade.Symbol, 20)
+	if err != nil {
+		log.Printf("[%s] Could not fetch position history, falling back to estimate: %v", trade.Symbol, err)
+		return 0, 0, "", false
+	}
+
+	for _, h := range history {
+		matched := (trade.PositionID != "" && h.PositionID == trade.PositionID) ||
+			(trade.PositionID == "" && h.Side == trade.Side &&
+				absDuration(time.UnixMilli(h.CreateTime).Sub(trade.EntryTime)) < 5*time.Minute)
+		if !matched {
+			continue
+		}
+
+		isLong := trade.Side == "LONG"
+		trailingActive := (isLong && trade.StopLoss > trade.EntryPrice) ||
+			(!isLong && trade.StopLoss < trade.EntryPrice)
+		switch {
+		case trailingActive:
+			reason = "Trailing stop"
+		case trade.TakeProfit > 0 && abs(h.ClosePrice-trade.TakeProfit) < abs(h.ClosePrice-trade.StopLoss):
+			reason = "Take Profit hit"
+		default:
+			reason = "Stop Loss hit"
+		}
+
+		log.Printf("[%s] Real close from exchange: exit=%.6f realizedPnL=%.4f (fee=%.4f funding=%.4f)",
+			trade.Symbol, h.ClosePrice, h.RealizedPnL, h.Fee, h.Funding)
+		return h.ClosePrice, h.RealizedPnL, reason, true
+	}
+
+	log.Printf("[%s] Closed position not found in exchange history, falling back to estimate", trade.Symbol)
+	return 0, 0, "", false
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 func abs(x float64) float64 {
@@ -685,11 +917,13 @@ func (e *Engine) analyzeSingleTimeframe(ctx context.Context, symbol string) (*st
 }
 
 func (e *Engine) analyzeMultiTimeframe(ctx context.Context, symbol string) (*strategy.Signal, float64, error) {
-	// Get primary (higher) timeframe candles
+	// Get primary (higher) timeframe candles. The in-progress candle is dropped:
+	// the strategy must only see closed candles (backtest semantics, no repaint).
 	primaryCandles, err := e.client.GetKlines(ctx, symbol, e.config.PrimaryInterval, 100, 0, 0)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get primary candles: %w", err)
 	}
+	primaryCandles = dropIncompleteCandle(primaryCandles, parseInterval(e.config.PrimaryInterval))
 
 	if len(primaryCandles) < 50 {
 		return nil, 0, fmt.Errorf("insufficient primary candles: %d", len(primaryCandles))
@@ -703,6 +937,7 @@ func (e *Engine) analyzeMultiTimeframe(ctx context.Context, symbol string) (*str
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get entry candles: %w", err)
 	}
+	entryCandles = dropIncompleteCandle(entryCandles, parseInterval(e.config.EntryInterval))
 
 	if len(entryCandles) < 60 {
 		return nil, 0, fmt.Errorf("insufficient entry candles: %d", len(entryCandles))
@@ -754,6 +989,19 @@ func (e *Engine) countOpenPositions() int {
 	return count
 }
 
+func (e *Engine) countOpenPositionsBySide(side string) int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	count := 0
+	for _, trade := range e.state.Trades {
+		if trade.Status == "OPEN" && trade.Side == side {
+			count++
+		}
+	}
+	return count
+}
+
 func (e *Engine) executeTrade(ctx context.Context, symbol string, signal *strategy.Signal, currentPrice float64) error {
 	info := e.symbolInfo[symbol]
 	if info == nil {
@@ -794,14 +1042,30 @@ func (e *Engine) executeTrade(ctx context.Context, symbol string, signal *strate
 		sideStr = "SHORT"
 	}
 
+	// Correlation guard: crypto alts move together, so N positions on the same
+	// side are effectively one bet at N times the risk. Cap same-direction exposure.
+	if e.config.MaxSameDirection > 0 && e.countOpenPositionsBySide(sideStr) >= e.config.MaxSameDirection {
+		log.Printf("[%s] Skipping %s signal: already %d open %s positions (max %d same direction)",
+			symbol, sideStr, e.countOpenPositionsBySide(sideStr), sideStr, e.config.MaxSameDirection)
+		return nil
+	}
+
+	// Funding guard: skip entries only when funding is extreme AGAINST the position
+	// (trailing-only exits can hold for days, and 0.1%/8h = 0.3%/day bleeds ~0.5R/week).
+	if e.config.FundingExtremeRate > 0 {
+		if rate, err := e.client.GetFundingRate(ctx, symbol); err == nil {
+			if (sideStr == "LONG" && rate > e.config.FundingExtremeRate) ||
+				(sideStr == "SHORT" && rate < -e.config.FundingExtremeRate) {
+				log.Printf("[%s] Skipping %s signal: extreme funding against position (%.4f%%/8h)",
+					symbol, sideStr, rate*100)
+				return nil
+			}
+		}
+	}
+
 	log.Printf("\n[%s] 📊 SIGNAL: %s @ %.4f", time.Now().Format("2006-01-02 15:04"), symbol, currentPrice)
 	log.Printf("         Side: %s | Qty: %.4f | SL: %.4f | TP: %.4f", sideStr, quantity, signal.SL, signal.TP)
 	log.Printf("         Reason: %s", signal.Reason)
-
-	if e.config.DryRun {
-		log.Printf("         [DRY RUN] Order not executed")
-		return nil
-	}
 
 	// Round quantity and create order
 	quantity = info.RoundQuantity(quantity)
@@ -825,6 +1089,36 @@ func (e *Engine) executeTrade(ctx context.Context, symbol string, signal *strate
 	// manager closes winners; the hard SL order still caps losses if the bot dies.
 	if !e.config.UseFixedTP {
 		tpPrice = 0
+	}
+
+	// Dry run: record a paper trade with the same SL/TP levels; exits are
+	// simulated bar-by-bar in simulateDryRunExits so stats accumulate and can
+	// be compared against the backtest and, later, live results.
+	if e.config.DryRun {
+		e.mu.Lock()
+		paper := Trade{
+			ID:         fmt.Sprintf("%s-%d", symbol, time.Now().UnixNano()),
+			Symbol:     symbol,
+			Side:       sideStr,
+			EntryPrice: currentPrice,
+			Quantity:   quantity,
+			StopLoss:   slPrice,
+			TakeProfit: tpPrice,
+			EntryTime:  time.Now(),
+			Reason:     "[DRY] " + signal.Reason,
+			Status:     "OPEN",
+		}
+		e.state.Trades = append(e.state.Trades, paper)
+		e.state.DailyTradeCount++
+		e.mu.Unlock()
+		log.Printf("         [DRY RUN] Paper trade recorded (qty %.4f, SL %.6f)", quantity, slPrice)
+
+		if e.telegram != nil {
+			if err := e.telegram.NotifyPositionOpened(symbol, sideStr+" [DRY]", currentPrice, quantity, tpPrice, slPrice, signal.Reason); err != nil {
+				log.Printf("Telegram notification error: %v", err)
+			}
+		}
+		return nil
 	}
 
 	order := &model.OrderRequest{
@@ -1171,6 +1465,23 @@ func (e *Engine) UpdateTradeStopLoss(tradeID string, newStopLoss float64) {
 		if e.state.Trades[i].ID == tradeID && e.state.Trades[i].Status == "OPEN" {
 			e.state.Trades[i].StopLoss = newStopLoss
 			log.Printf("[%s] Stop loss updated to %.6f", e.state.Trades[i].Symbol, newStopLoss)
+			break
+		}
+	}
+}
+
+// UpdateTradeTrailing persists trailing-stop progress on a trade: marks it
+// active, records the best price seen and moves StopLoss to the trail level.
+// State is saved with the regular cycle, so a restart resumes the trail.
+func (e *Engine) UpdateTradeTrailing(tradeID string, best, level float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for i := range e.state.Trades {
+		if e.state.Trades[i].ID == tradeID && e.state.Trades[i].Status == "OPEN" {
+			e.state.Trades[i].TrailActive = true
+			e.state.Trades[i].TrailBest = best
+			e.state.Trades[i].StopLoss = level
 			break
 		}
 	}

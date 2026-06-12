@@ -1301,6 +1301,118 @@ func (c *BitunixClient) GetPositions(ctx context.Context) ([]model.Position, err
 	return domainPositions, nil
 }
 
+// GetHistoryPositions returns closed positions from the exchange, newest first.
+// symbol is optional ("" = all symbols). The exchange reports the real realized
+// PnL, fees and funding for each closed position — this is the source of truth
+// for trade accounting (local estimates from TP/SL levels are approximations).
+func (c *BitunixClient) GetHistoryPositions(ctx context.Context, symbol string, limit int) ([]model.HistoryPosition, error) {
+	params := map[string]string{}
+	if symbol != "" {
+		params["symbol"] = symbol
+	}
+	if limit > 0 {
+		params["limit"] = strconv.Itoa(limit)
+	}
+
+	body, err := c.doRequest(ctx, "GET", "/api/v1/futures/position/get_history_positions", params, nil, true)
+	if err != nil {
+		return nil, fmt.Errorf("error getting history positions from Bitunix: %w", err)
+	}
+
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			PositionList []struct {
+				PositionID  string        `json:"positionId"`
+				Symbol      string        `json:"symbol"`
+				Side        string        `json:"side"`
+				MaxQty      string        `json:"maxQty"`
+				EntryPrice  string        `json:"entryPrice"`
+				ClosePrice  string        `json:"closePrice"`
+				RealizedPnL string        `json:"realizedPNL"`
+				Fee         string        `json:"fee"`
+				Funding     string        `json:"funding"`
+				CTime       FlexibleInt64 `json:"ctime"`
+				MTime       FlexibleInt64 `json:"mtime"`
+			} `json:"positionList"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("error decoding history positions response: %w (body: %.300s)", err, string(body))
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("bitunix API error: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+
+	var out []model.HistoryPosition
+	for _, p := range resp.Data.PositionList {
+		maxQty, _ := strconv.ParseFloat(p.MaxQty, 64)
+		entry, _ := strconv.ParseFloat(p.EntryPrice, 64)
+		closeP, _ := strconv.ParseFloat(p.ClosePrice, 64)
+		pnl, _ := strconv.ParseFloat(p.RealizedPnL, 64)
+		fee, _ := strconv.ParseFloat(p.Fee, 64)
+		funding, _ := strconv.ParseFloat(p.Funding, 64)
+
+		side := p.Side
+		switch side {
+		case "BUY":
+			side = "LONG"
+		case "SELL":
+			side = "SHORT"
+		}
+
+		out = append(out, model.HistoryPosition{
+			PositionID:  p.PositionID,
+			Symbol:      p.Symbol,
+			Side:        side,
+			MaxQty:      maxQty,
+			EntryPrice:  entry,
+			ClosePrice:  closeP,
+			RealizedPnL: pnl,
+			Fee:         fee,
+			Funding:     funding,
+			CreateTime:  int64(p.CTime),
+			CloseTime:   int64(p.MTime),
+		})
+	}
+
+	return out, nil
+}
+
+// GetFundingRate returns the current funding rate for a symbol (per 8h period).
+func (c *BitunixClient) GetFundingRate(ctx context.Context, symbol string) (float64, error) {
+	params := map[string]string{"symbol": symbol}
+
+	body, err := c.doRequest(ctx, "GET", "/api/v1/futures/market/funding_rate", params, nil, false)
+	if err != nil {
+		return 0, fmt.Errorf("error getting funding rate: %w", err)
+	}
+
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Symbol      string `json:"symbol"`
+			FundingRate string `json:"fundingRate"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, fmt.Errorf("error decoding funding rate response: %w (body: %.300s)", err, string(body))
+	}
+	if resp.Code != 0 {
+		return 0, fmt.Errorf("bitunix API error: code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+
+	rate, err := strconv.ParseFloat(resp.Data.FundingRate, 64)
+	if err != nil {
+		return 0, fmt.Errorf("could not parse funding rate %q", resp.Data.FundingRate)
+	}
+	return rate, nil
+}
+
 // FlashClosePosition closes a position using the flash close endpoint
 func (c *BitunixClient) FlashClosePosition(ctx context.Context, positionID string) error {
 	closeBody := map[string]interface{}{
