@@ -97,13 +97,17 @@ func DefaultConfig() Config {
 			"SUIUSDT",  // +61.90 (2ª mitad fuerte; también positivo en live real)
 			"TAOUSDT",  // +47.63 (1ª +26.5 / 2ª +21.1) 91% WR, 11 trades
 			"LTCUSDT",  // +43.79 (1ª +8.0 / 2ª +35.8)  82% WR, 11 trades
+			"BTCUSDT",  // +38.40 (1ª -8.3 / 2ª +46.7)  75% WR, maxDD 0.8% — liquidez y curva estable
 		},
 		PositionSizeUSDT:  12,    // Fallback: $12 per trade (was $16)
 		PositionSizePct:   0.05,  // 5% of account balance per trade (conservative for initial live tests)
 		Leverage:          3,     // Conservative 3x leverage for live trading
 		Interval:          "4h",  // Deprecated: kept for compatibility
 		PrimaryInterval:   "4h",  // Higher TF for trend direction
-		EntryInterval:     "1h",  // Lower TF for entry timing
+		// Entry on 4h, not 1h: backtest-v2 validated the strategy with 4h entry
+		// candles — SL/TP distances come from the entry TF's ATR, so 1h entries
+		// would trade tighter stops and more signals than what was validated.
+		EntryInterval:     "4h",
 		UseMultiTimeframe: true,  // Enable MTF by default
 		StateFile:         "/app/data/live_trading_state.json",
 		VolumeThreshold:   1.0,   // Require at least average volume
