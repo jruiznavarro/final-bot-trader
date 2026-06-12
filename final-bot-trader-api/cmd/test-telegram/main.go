@@ -34,7 +34,7 @@ func main() {
 
 	// Test startup notification
 	fmt.Print("Sending startup notification... ")
-	if err := client.NotifyStartup("TEST MODE", 10.00, 5); err != nil {
+	if err := client.NotifyStartup("TEST MODE", 0.05, 3, []string{"BTCUSDT"}, "4h", "1h", 5, 3); err != nil {
 		fmt.Printf("ERROR: %v\n", err)
 	} else {
 		fmt.Println("OK")

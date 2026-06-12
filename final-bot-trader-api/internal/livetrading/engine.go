@@ -78,21 +78,25 @@ type Config struct {
 	MaxDailyTrades    int           // Max trades per day
 	MaxOpenPositions  int           // Max simultaneous positions
 	CooldownPeriod    time.Duration // Min time between closing and re-entering same symbol
+	UseFixedTP        bool          // If true, place a fixed TP order; if false, exit via trailing stop + SL only
 	DryRun            bool          // If true, log signals but don't execute
 }
 
 // DefaultConfig returns default live trading configuration
 func DefaultConfig() Config {
 	return Config{
-		// Symbol list based on multifactor backtest + live performance (2026-06-12)
-		// LINKUSDT removed: 21% live win rate, -3.42 USDT (worst by far)
-		// SOLUSDT removed: 25% live win rate, -1.40 USDT in 24 trades + negative backtest
+		// Symbol list from backtest-v2 (2026-06-12, 22 months of 4h data, trailing-only
+		// exits, fees+slippage included). Criteria: positive PnL in BOTH halves of the
+		// period and enough trades to mean something. Consistent losers excluded
+		// everywhere: ETH, 1000SHIB, 1000PEPE, TRUMP, ADA, FIL, WLD, XRP, AVAX.
 		Symbols: []string{
-			"ENAUSDT",  // Live: 62% WR +2.07 USDT | Backtest: +3.41% Sharpe 234
-			"SUIUSDT",  // Live: 38% WR +0.82 USDT | Backtest: +5.63% Sharpe 372
-			"AAVEUSDT", // Live: 50% WR -0.24 USDT | Backtest: +3.41% Sharpe 234
-			"FILUSDT",  // Live: 40% WR +0.03 USDT | Backtest: +2.35% Sharpe 168
-			"DOGEUSDT", // Live: 53% WR +0.91 USDT | Backtest: +0.59% Sharpe 42
+			"DOGEUSDT", // +89.59 (1ª +39.3 / 2ª +50.3) 80% WR, 15 trades
+			"WIFUSDT",  // +82.60 (1ª +74.8 / 2ª +7.8)  89% WR,  9 trades
+			"ARBUSDT",  // +80.21 (1ª +20.9 / 2ª +59.3) 86% WR,  7 trades
+			"ENAUSDT",  // +59.53 (1ª +28.6 / 2ª +30.9) 73% WR, 15 trades
+			"SUIUSDT",  // +61.90 (2ª mitad fuerte; también positivo en live real)
+			"TAOUSDT",  // +47.63 (1ª +26.5 / 2ª +21.1) 91% WR, 11 trades
+			"LTCUSDT",  // +43.79 (1ª +8.0 / 2ª +35.8)  82% WR, 11 trades
 		},
 		PositionSizeUSDT:  12,    // Fallback: $12 per trade (was $16)
 		PositionSizePct:   0.05,  // 5% of account balance per trade (conservative for initial live tests)
@@ -105,8 +109,12 @@ func DefaultConfig() Config {
 		VolumeThreshold:   1.0,   // Require at least average volume
 		MaxDailyLoss:      5,              // Stop if losing $5/day (3% of $165)
 		MaxDailyTrades:    8,              // Max 8 trades per day (conservative)
-		MaxOpenPositions:  2,              // Max 2 positions at once (reduce risk)
+		MaxOpenPositions:  3,              // Trailing-only exits hold positions longer; 3x5%x3x = 45% notional max
 		CooldownPeriod:    4 * time.Hour,  // Don't re-enter same symbol for 1 primary candle
+		// Backtest-v2 (22 months, 30 symbols): fixed TP at 3.3 ATR capped winners.
+		// Trailing-only exits (act 4%, trail 1.5%) + hard SL: PF 1.08 -> 1.39,
+		// PnL +104 -> +525 USDT. Winners must run; the SL still caps losses.
+		UseFixedTP:        false,
 		DryRun:            false,
 	}
 }
@@ -545,8 +553,9 @@ func (e *Engine) calculateClosedTradePnL(ctx context.Context, trade *Trade) (exi
 	tpDist := abs(currentPrice - trade.TakeProfit)
 	slDist := abs(currentPrice - trade.StopLoss)
 
-	if trade.StopLoss > 0 && trade.TakeProfit > 0 {
-		// Check if trailing stop moved the SL past entry (into profit territory)
+	if trade.StopLoss > 0 {
+		// Check if trailing stop moved the SL past entry (into profit territory).
+		// The TrailingStopManager keeps trade.StopLoss updated to the trail level.
 		trailingActive := (isLong && trade.StopLoss > trade.EntryPrice) ||
 			(!isLong && trade.StopLoss < trade.EntryPrice)
 
@@ -554,10 +563,11 @@ func (e *Engine) calculateClosedTradePnL(ctx context.Context, trade *Trade) (exi
 			// Trailing stop fired: exit at the current trailing SL level
 			exitPrice = trade.StopLoss
 			reason = "Trailing stop"
-		} else if tpDist < slDist {
+		} else if trade.TakeProfit > 0 && tpDist < slDist {
 			exitPrice = trade.TakeProfit
 			reason = "Take Profit hit"
 		} else {
+			// Trailing-only mode (no TP order) or price closest to SL
 			exitPrice = trade.StopLoss
 			reason = "Stop Loss hit"
 		}
@@ -807,6 +817,12 @@ func (e *Engine) executeTrade(ctx context.Context, symbol string, signal *strate
 		pricePrecision = 6
 	}
 
+	// Trailing-only exit mode: no fixed TP on the exchange. The trailing stop
+	// manager closes winners; the hard SL order still caps losses if the bot dies.
+	if !e.config.UseFixedTP {
+		tpPrice = 0
+	}
+
 	order := &model.OrderRequest{
 		Symbol:            symbol,
 		Side:              side,
@@ -861,7 +877,7 @@ func (e *Engine) executeTrade(ctx context.Context, symbol string, signal *strate
 		EntryPrice: realEntryPrice,
 		Quantity:   realQuantity,
 		StopLoss:   signal.SL,
-		TakeProfit: signal.TP,
+		TakeProfit: tpPrice, // 0 in trailing-only mode (no TP order on exchange)
 		EntryTime:  time.Now(),
 		OrderID:    resp.OrderID,
 		Reason:     signal.Reason,
@@ -893,7 +909,7 @@ func (e *Engine) executeTrade(ctx context.Context, symbol string, signal *strate
 
 	// Send Telegram notification
 	if e.telegram != nil {
-		if err := e.telegram.NotifyPositionOpened(symbol, sideStr, realEntryPrice, realQuantity, signal.TP, signal.SL, signal.Reason); err != nil {
+		if err := e.telegram.NotifyPositionOpened(symbol, sideStr, realEntryPrice, realQuantity, tpPrice, signal.SL, signal.Reason); err != nil {
 			log.Printf("Telegram notification error: %v", err)
 		}
 	}
