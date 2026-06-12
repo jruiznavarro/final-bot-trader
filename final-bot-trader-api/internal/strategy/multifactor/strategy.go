@@ -371,11 +371,12 @@ func (s *MultiFactorStrategy) generateSignal(
 	longScore := countTrue(longConditions)
 	shortScore := countTrue(shortConditions)
 
-	// Require at least 6 out of 7 conditions.
-	// The macro-EMA filter is condition 7 and acts as a hard gate: if price is
-	// deep against the 50-EMA, that condition alone drops the score below the
-	// threshold even if all other 6 are met.
-	minScore := 6
+	// Require ALL 7 conditions. Live results (mar-may 2026, 130 trades) showed
+	// that allowing one failed condition (6/7) produced 47 trades with 34% WR
+	// and -3.99 USDT — almost all of them chasing entries with RSI outside the
+	// allowed band (LONGs at RSI 66-91, SHORTs at RSI 17-33). Trades with 7/7
+	// were net positive (+1.29 USDT, 43% WR).
+	minScore := len(longConditions)
 
 	if longScore >= minScore && longScore > shortScore {
 		signalType = strategy.SignalBuy

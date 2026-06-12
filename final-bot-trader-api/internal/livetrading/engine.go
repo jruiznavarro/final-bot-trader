@@ -18,6 +18,17 @@ import (
 	"final-bot-trader-api/internal/telegram"
 )
 
+// takerFeeRate is Bitunix futures taker fee (0.06%). Entries are MARKET orders
+// and TP/SL fills are also taker, so every round trip pays the fee twice.
+// Over the mar-may 2026 live period this was ~2.7 USDT across 130 trades —
+// more than the strategy's entire gross edge — so PnL must account for it.
+const takerFeeRate = 0.0006
+
+// estimatedFees returns the estimated round-trip fees for a trade.
+func estimatedFees(entryPrice, exitPrice, quantity float64) float64 {
+	return (entryPrice*quantity + exitPrice*quantity) * takerFeeRate
+}
+
 // Trade represents an executed trade
 type Trade struct {
 	ID            string    `json:"id"`
@@ -73,16 +84,15 @@ type Config struct {
 // DefaultConfig returns default live trading configuration
 func DefaultConfig() Config {
 	return Config{
-		// Symbol list based on multifactor backtest + live performance (2026-04-07)
-		// LINKUSDT removed: 23% live win rate, -3.21 USDT in 23 days (worst by far)
-		// AAVEUSDT added: +3.41% backtest return, 48.5% WR, MaxDD 1.5%
+		// Symbol list based on multifactor backtest + live performance (2026-06-12)
+		// LINKUSDT removed: 21% live win rate, -3.42 USDT (worst by far)
+		// SOLUSDT removed: 25% live win rate, -1.40 USDT in 24 trades + negative backtest
 		Symbols: []string{
-			"ENAUSDT",  // Live: 61.5% WR +0.25 USDT | Backtest: +3.41% Sharpe 234
-			"SUIUSDT",  // Live: 41.2% WR +0.39 USDT | Backtest: +5.63% Sharpe 372
-			"AAVEUSDT", // Live: N/A (new)           | Backtest: +3.41% Sharpe 234
-			"FILUSDT",  // Live: 60.0% WR +2.40 USDT | Backtest: +2.35% Sharpe 168
-			"SOLUSDT",  // Live: 35.7% WR +0.74 USDT | Backtest: -1.39% (watch)
-			"DOGEUSDT", // Live: 62.5% WR +1.09 USDT | Backtest: +0.59% Sharpe 42
+			"ENAUSDT",  // Live: 62% WR +2.07 USDT | Backtest: +3.41% Sharpe 234
+			"SUIUSDT",  // Live: 38% WR +0.82 USDT | Backtest: +5.63% Sharpe 372
+			"AAVEUSDT", // Live: 50% WR -0.24 USDT | Backtest: +3.41% Sharpe 234
+			"FILUSDT",  // Live: 40% WR +0.03 USDT | Backtest: +2.35% Sharpe 168
+			"DOGEUSDT", // Live: 53% WR +0.91 USDT | Backtest: +0.59% Sharpe 42
 		},
 		PositionSizeUSDT:  12,    // Fallback: $12 per trade (was $16)
 		PositionSizePct:   0.05,  // 5% of account balance per trade (conservative for initial live tests)
@@ -560,14 +570,15 @@ func (e *Engine) calculateClosedTradePnL(ctx context.Context, trade *Trade) (exi
 		reason = "Closed (price unknown)"
 	}
 
-	// Calculate PnL with the resolved exit price
+	// Calculate PnL with the resolved exit price, net of round-trip taker fees
 	if isLong {
 		pnl = (exitPrice - trade.EntryPrice) * trade.Quantity
 	} else {
 		pnl = (trade.EntryPrice - exitPrice) * trade.Quantity
 	}
+	pnl -= estimatedFees(trade.EntryPrice, exitPrice, trade.Quantity)
 
-	log.Printf("[%s] Trade closed: entry=%.6f exit=%.6f qty=%.4f pnl=%.4f reason=%s",
+	log.Printf("[%s] Trade closed: entry=%.6f exit=%.6f qty=%.4f pnl=%.4f (net of fees) reason=%s",
 		trade.Symbol, trade.EntryPrice, exitPrice, trade.Quantity, pnl, reason)
 
 	return exitPrice, pnl, reason
@@ -944,7 +955,7 @@ func (e *Engine) CloseTradeFictitious(ctx context.Context, tradeID string) error
 		currentPrice = trade.EntryPrice // Fallback to entry price (PnL = 0)
 	}
 
-	// Calculate PnL
+	// Calculate PnL net of round-trip taker fees
 	isLong := trade.Side == "LONG"
 	var pnl float64
 	if isLong {
@@ -952,6 +963,7 @@ func (e *Engine) CloseTradeFictitious(ctx context.Context, tradeID string) error
 	} else {
 		pnl = (trade.EntryPrice - currentPrice) * trade.Quantity
 	}
+	pnl -= estimatedFees(trade.EntryPrice, currentPrice, trade.Quantity)
 
 	// Determine exit reason based on price
 	reason := "Manual close (fictitious)"

@@ -139,13 +139,18 @@ func (s *MTFStrategy) AnalyzeMTF(primaryCandles, entryCandles, dailyCandles []mo
 		}
 	}
 
-	// Step 4: Daily RSI filter — block SHORTs when daily RSI < 38.
-	// A deeply oversold daily chart means the market is exhausted to the downside
-	// and prone to sharp bounces. Entering SHORTs at those levels leads to being
-	// stopped out by the recovery (root cause of April 12-13 losses).
-	if entrySignal.Type == strategy.SignalSell && len(dailyCandles) >= 15 {
+	// Step 4: Daily RSI filter — block entries against a macro extreme.
+	// SHORTs blocked when daily RSI < 38: a deeply oversold daily chart means the
+	// market is exhausted to the downside and prone to sharp bounces (root cause
+	// of April 12-13 losses). LONGs blocked when daily RSI > 65 for the symmetric
+	// reason: live results showed LONGs were the losing side (-4.74 USDT, 39% WR),
+	// mostly entries chasing an already-extended move that then mean-reverted.
+	if len(dailyCandles) >= 15 {
 		dailyRSI := LastRSI(dailyCandles, 14)
-		if dailyRSI < 38 {
+		if entrySignal.Type == strategy.SignalSell && dailyRSI < 38 {
+			return nil, strategy.ErrNoSignal
+		}
+		if entrySignal.Type == strategy.SignalBuy && dailyRSI > 65 {
 			return nil, strategy.ErrNoSignal
 		}
 	}

@@ -49,14 +49,12 @@ func main() {
 		}
 	}
 
-	// Create configuration
+	// Create configuration. Risk limits come from livetrading.DefaultConfig()
+	// (5 USDT max daily loss, 8 trades/day, 2 open positions, volume >= 1.2x avg).
+	// Previous overrides here (50 USDT daily loss = 30% of the account, 20
+	// trades/day, relaxed 0.7x volume) defeated the engine's risk management.
 	config := livetrading.DefaultConfig()
-	config.PositionSizeUSDT = 10   // Minimum: $10 per trade
-	config.Leverage = 3            // 3x leverage (conservative)
-	config.MaxDailyLoss = 50       // Stop if losing $50/day
-	config.MaxDailyTrades = 20     // Max 20 trades/day
-	config.MaxOpenPositions = 3    // Max 3 positions at once
-	config.VolumeThreshold = 0.7   // Relaxed volume threshold
+	config.PositionSizeUSDT = 10 // Fallback if balance lookup fails: $10 per trade
 	config.DryRun = dryRun
 
 	// Display configuration
