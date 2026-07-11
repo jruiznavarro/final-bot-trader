@@ -45,9 +45,17 @@ const (
 	posPct       = 0.05   // 5% of balance per trade
 	leverage     = 3.0
 	initialBal   = 1000.0
-	lookback     = 80 // candles of history fed to the strategy
-	cooldownBars = 1  // 1 bar = 4h, matches live CooldownPeriod
+	cooldownBars = 1 // 1 bar = 4h, matches live CooldownPeriod
 )
+
+// lookback: candles of history fed to the strategy. Live fetches 100 and drops
+// the open one, so 99 matches live; the original backtest used 80.
+var lookback = 99
+
+// dailyDepth: 4h bars aggregated into daily candles for the daily RSI filter.
+// Live fetches 30 real 1d candles (~180 bars); 0 = aggregate only from the
+// lookback window (original behavior, which left the filter mostly inactive).
+var dailyDepth = 180
 
 type Variant struct {
 	Name         string
@@ -56,15 +64,20 @@ type Variant struct {
 	TrailActPct  float64 // trailing activation profit %
 	TrailPct     float64 // trail distance %
 	DailyPrimary bool    // primary TF = aggregated 1d instead of 4h
+	BreakevenPct float64 // move SL to entry once profit reaches this % (0 = disabled)
+	MaxSLPct     float64 // cap ATR stop distance at this % of entry (0 = no cap)
 }
 
 var variants = []Variant{
-	{Name: "A current-live", UseFixedTP: true, TrailActPct: 4.0, TrailPct: 1.5},
-	{Name: "B +btc-filter", BTCFilter: true, UseFixedTP: true, TrailActPct: 4.0, TrailPct: 1.5},
-	{Name: "C btc+trail-2.5/2.0", BTCFilter: true, TrailActPct: 2.5, TrailPct: 2.0},
-	{Name: "D btc+trail-4.0/1.5", BTCFilter: true, TrailActPct: 4.0, TrailPct: 1.5},
-	{Name: "E daily-primary", BTCFilter: true, TrailActPct: 4.0, TrailPct: 1.5, DailyPrimary: true},
 	{Name: "F trail-only-no-btc", TrailActPct: 4.0, TrailPct: 1.5},
+	{Name: "G F+breakeven-2.0", TrailActPct: 4.0, TrailPct: 1.5, BreakevenPct: 2.0},
+	{Name: "H F+slcap-4.0", TrailActPct: 4.0, TrailPct: 1.5, MaxSLPct: 4.0},
+	{Name: "I F+act-3.0", TrailActPct: 3.0, TrailPct: 1.5},
+	{Name: "J F+be2.0+slcap4.0", TrailActPct: 4.0, TrailPct: 1.5, BreakevenPct: 2.0, MaxSLPct: 4.0},
+	{Name: "K F+be2.5+act3.0", TrailActPct: 3.0, TrailPct: 1.5, BreakevenPct: 2.5},
+	{Name: "L act3.0+slcap4.0", TrailActPct: 3.0, TrailPct: 1.5, MaxSLPct: 4.0},
+	{Name: "M act3.0+trail2.0", TrailActPct: 3.0, TrailPct: 2.0},
+	{Name: "N act2.5", TrailActPct: 2.5, TrailPct: 1.5},
 }
 
 type Trade struct {
@@ -79,20 +92,24 @@ type Trade struct {
 }
 
 type SymbolResult struct {
-	Symbol  string
-	Trades  int
-	Wins    int
-	PnL     float64
-	PnL1    float64 // first half of period
-	PnL2    float64 // second half
-	GrossW  float64
-	GrossL  float64
-	MaxDD   float64
-	balance float64
+	Symbol    string
+	Trades    int
+	Wins      int
+	PnL       float64
+	PnL1      float64 // first half of period
+	PnL2      float64 // second half
+	PnLRec    float64 // last 90 days
+	TradesRec int
+	GrossW    float64
+	GrossL    float64
+	MaxDD     float64
+	balance   float64
 }
 
 func main() {
 	dataDir := flag.String("data", "data/historical", "historical data directory")
+	flag.IntVar(&lookback, "lookback", 99, "candles of history fed to the strategy")
+	flag.IntVar(&dailyDepth, "dailydepth", 180, "4h bars aggregated for the daily RSI filter (0 = from lookback window only)")
 	flag.Parse()
 
 	btcCandles, err := loadCSV(filepath.Join(*dataDir, "BTCUSDT_4h.csv"))
@@ -133,11 +150,13 @@ func main() {
 			results = append(results, r)
 		}
 
-		var pnl, gw, gl float64
-		var trades, wins int
+		var pnl, gw, gl, pnlRec float64
+		var trades, wins, tradesRec int
 		for _, r := range results {
 			pnl += r.PnL
+			pnlRec += r.PnLRec
 			trades += r.Trades
+			tradesRec += r.TradesRec
 			wins += r.Wins
 			gw += r.GrossW
 			gl += r.GrossL
@@ -151,17 +170,17 @@ func main() {
 		}
 
 		fmt.Printf("\n══════ %s ══════\n", v.Name)
-		fmt.Printf("TOTAL: %d trades | WR %.1f%% | PF %.2f | PnL %+.2f USDT (sobre %d cuentas de %.0f)\n",
-			trades, wr, pf, pnl, len(results), initialBal)
+		fmt.Printf("TOTAL: %d trades | WR %.1f%% | PF %.2f | PnL %+.2f USDT | últimos 90d: %+.2f (%d trades) (sobre %d cuentas de %.0f)\n",
+			trades, wr, pf, pnl, pnlRec, tradesRec, len(results), initialBal)
 
 		sort.Slice(results, func(i, j int) bool { return results[i].PnL > results[j].PnL })
-		fmt.Printf("%-14s %6s %5s %9s %9s %9s %7s\n", "symbol", "trades", "WR%", "pnl", "1ªmitad", "2ªmitad", "maxDD%")
+		fmt.Printf("%-14s %6s %5s %9s %9s %9s %9s %7s\n", "symbol", "trades", "WR%", "pnl", "1ªmitad", "2ªmitad", "últ.90d", "maxDD%")
 		for _, r := range results {
 			if r.Trades == 0 {
 				continue
 			}
-			fmt.Printf("%-14s %6d %5.0f %+9.2f %+9.2f %+9.2f %7.1f\n",
-				r.Symbol, r.Trades, float64(r.Wins)/float64(r.Trades)*100, r.PnL, r.PnL1, r.PnL2, r.MaxDD)
+			fmt.Printf("%-14s %6d %5.0f %+9.2f %+9.2f %+9.2f %+9.2f %7.1f\n",
+				r.Symbol, r.Trades, float64(r.Wins)/float64(r.Trades)*100, r.PnL, r.PnL1, r.PnL2, r.PnLRec, r.MaxDD)
 		}
 		summaries = append(summaries, variantSummary{
 			Name: v.Name, PnL: pnl, Trades: trades, WinRate: wr, PF: pf, PerSym: results,
@@ -219,6 +238,7 @@ func runSymbol(symbol string, candles, btc []model.Candle, btcBull []bool, v Var
 	res := SymbolResult{Symbol: symbol, balance: initialBal}
 	maxBal := initialBal
 	half := candles[len(candles)/2].OpenTime
+	recent := candles[len(candles)-1].OpenTime.Add(-90 * 24 * time.Hour)
 
 	// align BTC bars by timestamp
 	btcIdxByTime := map[int64]int{}
@@ -259,6 +279,10 @@ func runSymbol(symbol string, candles, btc []model.Candle, btcBull []bool, v Var
 			res.PnL1 += t.PnL
 		} else {
 			res.PnL2 += t.PnL
+		}
+		if !when.Before(recent) {
+			res.PnLRec += t.PnL
+			res.TradesRec++
 		}
 		res.Trades++
 		if t.PnL >= 0 {
@@ -319,6 +343,13 @@ func runSymbol(symbol string, candles, btc []model.Candle, btcBull []bool, v Var
 				ext = bar.Low
 				profitPct = (pos.Entry - ext) / pos.Entry * 100
 			}
+			// breakeven: once the trade has shown BreakevenPct profit, the hard SL
+			// moves to entry (actionable next bar, like the trailing level)
+			if v.BreakevenPct > 0 && !trailActive && profitPct >= v.BreakevenPct {
+				if (isLong && pos.Entry > sl) || (!isLong && pos.Entry < sl) {
+					sl = pos.Entry
+				}
+			}
 			if !trailActive && profitPct >= v.TrailActPct {
 				trailActive = true
 				trailBest = ext
@@ -341,7 +372,18 @@ func runSymbol(symbol string, candles, btc []model.Candle, btcBull []bool, v Var
 
 		// build inputs exactly like the live engine
 		hist := candles[i-lookback+1 : i+1]
+		// live fetches 30 real 1d candles for the daily RSI filter; aggregate the
+		// same depth here (~30 days = 180 4h bars). Aggregating only from hist
+		// (~16 days) left the filter below its 15-candle minimum, silently
+		// disabling in the backtest a filter that IS active in live.
 		daily := aggregateDaily(hist)
+		if dailyDepth > 0 {
+			dailyStart := i - dailyDepth
+			if dailyStart < 0 {
+				dailyStart = 0
+			}
+			daily = aggregateDaily(candles[dailyStart : i+1])
+		}
 		primary := hist
 		if v.DailyPrimary {
 			// daily primary needs more history than the entry lookback window
@@ -385,6 +427,19 @@ func runSymbol(symbol string, candles, btc []model.Candle, btcBull []bool, v Var
 		}
 		pos = &Trade{Symbol: symbol, Side: side, Entry: entry, EntryTime: next.OpenTime}
 		sl, tp = sig.SL, sig.TP
+		// cap the ATR stop distance: high-ATR entries (meme coins) can put the
+		// stop 6-7% away, twice the typical trailing win
+		if v.MaxSLPct > 0 {
+			if side == "LONG" {
+				if minSL := entry * (1 - v.MaxSLPct/100); sl < minSL {
+					sl = minSL
+				}
+			} else {
+				if maxSL := entry * (1 + v.MaxSLPct/100); sl > maxSL {
+					sl = maxSL
+				}
+			}
+		}
 		trailActive = false
 	}
 

@@ -216,15 +216,42 @@ func main() {
 	fmt.Printf("\nSummary saved to: %s\n", summaryFile)
 }
 
+func intervalDuration(interval string) time.Duration {
+	switch interval {
+	case "1m":
+		return time.Minute
+	case "5m":
+		return 5 * time.Minute
+	case "15m":
+		return 15 * time.Minute
+	case "30m":
+		return 30 * time.Minute
+	case "1h":
+		return time.Hour
+	case "2h":
+		return 2 * time.Hour
+	case "4h":
+		return 4 * time.Hour
+	case "1d":
+		return 24 * time.Hour
+	default:
+		return 4 * time.Hour
+	}
+}
+
 func downloadSymbolData(ctx context.Context, client *exchange.BitunixClient, symbol, interval string, startTime, endTime time.Time) ([]model.Candle, error) {
 	var allCandles []model.Candle
 
-	// Download in chunks (API limit)
-	chunkSize := 500
+	// Download in chunks. Bitunix returns at most ~200 candles per request, so
+	// each chunk must span no more than that: 3-month chunks (540 4h bars)
+	// silently lost 2 of every 3 months of history.
+	chunkSize := 200
+	barDur := intervalDuration(interval)
+	chunkSpan := time.Duration(chunkSize-20) * barDur // margin under the API cap
 	currentEnd := endTime
 
 	for currentEnd.After(startTime) {
-		currentStart := currentEnd.AddDate(0, -3, 0) // 3 months chunks
+		currentStart := currentEnd.Add(-chunkSpan)
 		if currentStart.Before(startTime) {
 			currentStart = startTime
 		}
@@ -240,7 +267,7 @@ func downloadSymbolData(ctx context.Context, client *exchange.BitunixClient, sym
 		}
 
 		allCandles = append(allCandles, candles...)
-		currentEnd = currentStart.Add(-time.Hour) // Move back
+		currentEnd = currentStart.Add(-barDur) // Move back
 
 		time.Sleep(200 * time.Millisecond) // Rate limiting
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,24 +87,26 @@ type Config struct {
 	MaxSameDirection  int           // Max simultaneous positions on the same side (0 = no limit)
 	FundingExtremeRate float64      // Skip entry if funding against position exceeds this per-8h rate (0 = disabled)
 	DryRun            bool          // If true, record paper trades and simulate exits (no real orders)
+	DryRunBalanceUSDT float64      // Simulated account balance for dry-run sizing (compounds with paper PnL)
 }
 
 // DefaultConfig returns default live trading configuration
 func DefaultConfig() Config {
 	return Config{
-		// Symbol list from backtest-v2 (2026-06-12, 22 months of 4h data, trailing-only
-		// exits, fees+slippage included). Criteria: positive PnL in BOTH halves of the
-		// period and enough trades to mean something. Consistent losers excluded
-		// everywhere: ETH, 1000SHIB, 1000PEPE, TRUMP, ADA, FIL, WLD, XRP, AVAX.
+		// Symbol list from backtest-v2 re-run 2026-07-11 on CLEAN data. The previous
+		// list was validated on CSVs with 2-month gaps (data-downloader chunking bug)
+		// and included symbols that are net losers on gap-free data: ARB -51, LTC -10,
+		// SUI -10, BTC -10, ENA borderline. Criteria unchanged: positive PnL in BOTH
+		// halves of the 2-year period, 18+ trades. Variant I (trailing act 3.0%).
 		Symbols: []string{
-			"DOGEUSDT", // +89.59 (1ª +39.3 / 2ª +50.3) 80% WR, 15 trades
-			"WIFUSDT",  // +82.60 (1ª +74.8 / 2ª +7.8)  89% WR,  9 trades
-			"ARBUSDT",  // +80.21 (1ª +20.9 / 2ª +59.3) 86% WR,  7 trades
-			"ENAUSDT",  // +59.53 (1ª +28.6 / 2ª +30.9) 73% WR, 15 trades
-			"SUIUSDT",  // +61.90 (2ª mitad fuerte; también positivo en live real)
-			"TAOUSDT",  // +47.63 (1ª +26.5 / 2ª +21.1) 91% WR, 11 trades
-			"LTCUSDT",  // +43.79 (1ª +8.0 / 2ª +35.8)  82% WR, 11 trades
-			"BTCUSDT",  // +38.40 (1ª -8.3 / 2ª +46.7)  75% WR, maxDD 0.8% — liquidez y curva estable
+			"WIFUSDT",      // +130.71 (1ª +58.7 / 2ª +72.1) 83% WR, 29 trades
+			"TAOUSDT",      // +116.66 (1ª +37.9 / 2ª +78.8) 91% WR, 23 trades
+			"HBARUSDT",     // +81.86  (1ª +59.6 / 2ª +22.2) 78% WR, 32 trades
+			"AAVEUSDT",     // +60.57  (1ª +29.0 / 2ª +31.6) 83% WR, 23 trades
+			"HYPEUSDT",     // +46.42  (1ª +29.7 / 2ª +16.8) 81% WR, 21 trades
+			"APTUSDT",      // +39.80  (1ª +31.5 / 2ª +8.3)  67% WR, 24 trades
+			"1000PEPEUSDT", // +39.59  (1ª +19.0 / 2ª +20.6) 73% WR, 26 trades
+			"DOGEUSDT",     // +27.67  (1ª +4.3  / 2ª +23.3) 70% WR, 23 trades
 		},
 		PositionSizeUSDT:  12,    // Fallback: $12 per trade (was $16)
 		PositionSizePct:   0.05,  // 5% of account balance per trade (conservative for initial live tests)
@@ -121,13 +124,14 @@ func DefaultConfig() Config {
 		MaxDailyTrades:    8,              // Max 8 trades per day (conservative)
 		MaxOpenPositions:  3,              // Trailing-only exits hold positions longer; 3x5%x3x = 45% notional max
 		CooldownPeriod:    4 * time.Hour,  // Don't re-enter same symbol for 1 primary candle
-		// Backtest-v2 (22 months, 30 symbols): fixed TP at 3.3 ATR capped winners.
-		// Trailing-only exits (act 4%, trail 1.5%) + hard SL: PF 1.08 -> 1.39,
-		// PnL +104 -> +525 USDT. Winners must run; the SL still caps losses.
+		// Backtest-v2 on clean data (2026-07-11, 2 years, 30 symbols): trailing-only
+		// exits (act 3%, trail 1.5%) + hard SL: PF 1.19, +414 USDT vs PF 1.06, +171
+		// with act 4%. Winners must run; the SL still caps losses.
 		UseFixedTP:        false,
 		MaxSameDirection:  2,      // 3 alts long at once = one bet at 3x risk; cap at 2 per side
 		FundingExtremeRate: 0.001, // skip entries paying >0.1%/8h funding against the position
 		DryRun:            false,
+		DryRunBalanceUSDT: 1000,  // same starting balance as backtest-v2, so stats are comparable
 	}
 }
 
@@ -240,6 +244,23 @@ func (e *Engine) ReconcileState() {
 		t := &e.state.Trades[i]
 		if t.Status != "CLOSED" {
 			continue
+		}
+
+		// Backfill paper trades recorded with quantity 0 (old dry-run sizing bug:
+		// the real exchange balance was dust, so every trade sized to 0 and closed
+		// with PnL exactly 0, inflating the win count). Re-size them with the
+		// simulated balance (non-compounding estimate) and recompute PnL.
+		if t.Quantity == 0 && t.EntryPrice > 0 && t.ExitPrice > 0 &&
+			strings.Contains(t.Reason, "[DRY]") && e.config.DryRunBalanceUSDT > 0 {
+			notional := e.config.DryRunBalanceUSDT * e.config.PositionSizePct * float64(e.config.Leverage)
+			t.Quantity = notional / t.EntryPrice
+			if t.Side == "LONG" {
+				t.PnL = (t.ExitPrice - t.EntryPrice) * t.Quantity
+			} else {
+				t.PnL = (t.EntryPrice - t.ExitPrice) * t.Quantity
+			}
+			t.PnL -= estimatedFees(t.EntryPrice, t.ExitPrice, t.Quantity)
+			log.Printf("[%s] Backfilled qty-0 paper trade: qty=%.4f pnl=%+.4f", t.Symbol, t.Quantity, t.PnL)
 		}
 
 		// Repair trades that were closed without an exit price (legacy state).
@@ -1010,13 +1031,28 @@ func (e *Engine) executeTrade(ctx context.Context, symbol string, signal *strate
 
 	// Calculate position size from account balance
 	positionSize := e.config.PositionSizeUSDT // fallback
-	if e.config.PositionSizePct > 0 {
+	if e.config.DryRun {
+		// Paper trading sizes from a simulated account that compounds paper PnL
+		// (same semantics as backtest-v2). Never use the real exchange balance:
+		// a dust balance there sized every paper trade to quantity 0, so PnL was
+		// always exactly 0 and the win/loss stats were meaningless.
+		e.mu.RLock()
+		equity := e.config.DryRunBalanceUSDT + e.state.TotalPnL
+		e.mu.RUnlock()
+		if e.config.PositionSizePct > 0 && equity > 0 {
+			positionSize = equity * e.config.PositionSizePct
+		}
+		log.Printf("[%s] DRY balance: $%.2f | Position size: $%.2f (%.0f%%)",
+			symbol, equity, positionSize, e.config.PositionSizePct*100)
+	} else if e.config.PositionSizePct > 0 {
 		accountInfo, accErr := e.client.GetAccountInfo(ctx)
-		if accErr == nil && accountInfo.AvailableBalance > 0 {
+		// Require a usable balance, not just > 0: a dust balance (cents) would
+		// size the position to a quantity that rounds to zero.
+		if accErr == nil && accountInfo.AvailableBalance*e.config.PositionSizePct >= 1 {
 			positionSize = accountInfo.AvailableBalance * e.config.PositionSizePct
 			log.Printf("[%s] Balance: $%.2f | Position size: $%.2f (%.0f%%)", symbol, accountInfo.AvailableBalance, positionSize, e.config.PositionSizePct*100)
 		} else {
-			log.Printf("[%s] Could not get balance, using fallback $%.2f", symbol, positionSize)
+			log.Printf("[%s] Balance unavailable or too low, using fallback $%.2f", symbol, positionSize)
 		}
 	}
 
@@ -1068,7 +1104,18 @@ func (e *Engine) executeTrade(ctx context.Context, symbol string, signal *strate
 	log.Printf("         Reason: %s", signal.Reason)
 
 	// Round quantity and create order
+	rawQuantity := quantity
 	quantity = info.RoundQuantity(quantity)
+	if quantity <= 0 {
+		if e.config.DryRun {
+			// Paper trades don't need exchange lot sizes; keep the raw quantity
+			// so the simulated PnL is never silently zeroed.
+			quantity = rawQuantity
+		} else {
+			log.Printf("[%s] Skipping signal: notional $%.2f rounds to zero quantity", symbol, notionalValue)
+			return nil
+		}
+	}
 
 	// For small-priced coins, use raw TP/SL values if RoundPrice returns 0
 	tpPrice := info.RoundPrice(signal.TP)

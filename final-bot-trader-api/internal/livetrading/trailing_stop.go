@@ -20,18 +20,18 @@ type TrailingStopConfig struct {
 }
 
 // DefaultTrailingStopConfig returns default trailing stop configuration.
-// Parameters are calibrated to the multifactor strategy's ATR-based TP/SL:
-//   - Strategy SL = ATR×2.2 (~4.4% avg) | TP = ATR×3.3 (~6.6% avg) → R:R 1:1.5
-//   - Activation at 4.0% = ~60% of the TP target: trailing only fires when the
-//     trade has already demonstrated strong directional movement.
-//   - Trail of 1.5% gives enough buffer for 4h crypto volatility without
-//     cutting the position before it reaches the TP.
-//   - Minimum locked profit when trailing fires: 4.0% - 1.5% = 2.5%
-//     (vs -4.4% SL = still 2.5:4.4 favorable, and most wins reach TP first).
+// Parameters validated by backtest-v2 on CLEAN 2-year 4h data (2026-07-11,
+// gap-free download, 100-candle window and active daily RSI filter — the same
+// inputs the live engine sees):
+//   - Activation at 3.0%: 30 symbols, PF 1.19, +414 USDT vs PF 1.06, +171 with
+//     the previous 4.0%. Many trades peaked between +3% and +4% and then hit
+//     the full ATR stop; activating earlier converts those into small wins.
+//   - Trail of 1.5% gives enough buffer for 4h crypto volatility.
+//   - Minimum locked profit when trailing fires: 3.0% - 1.5% = 1.5%.
 func DefaultTrailingStopConfig() TrailingStopConfig {
 	return TrailingStopConfig{
 		Enabled:          true,
-		ActivationPct:    4.0, // Activate at ~60% of TP target (~6.6%)
+		ActivationPct:    3.0, // backtest-v2 variant I (clean data)
 		TrailPct:         1.5, // 1.5% buffer — enough for 4h crypto volatility
 		CheckIntervalSec: 15,  // Check every 15 seconds
 	}
