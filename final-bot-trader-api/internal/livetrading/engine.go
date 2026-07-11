@@ -242,6 +242,16 @@ func (e *Engine) ReconcileState() {
 
 	for i := range e.state.Trades {
 		t := &e.state.Trades[i]
+
+		// OPEN paper trades from the qty-0 era: assign a quantity now so their
+		// eventual close computes a real PnL.
+		if t.Status == "OPEN" && t.Quantity == 0 && t.EntryPrice > 0 &&
+			strings.Contains(t.Reason, "[DRY]") && e.config.DryRunBalanceUSDT > 0 {
+			notional := e.config.DryRunBalanceUSDT * e.config.PositionSizePct * float64(e.config.Leverage)
+			t.Quantity = notional / t.EntryPrice
+			log.Printf("[%s] Backfilled qty on open paper trade: qty=%.4f", t.Symbol, t.Quantity)
+		}
+
 		if t.Status != "CLOSED" {
 			continue
 		}
